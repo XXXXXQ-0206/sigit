@@ -14,6 +14,15 @@
   from the first user message — and a request may filter on `cwd` so one
   project is never offered another's threads. Threads saved before this have no
   sidecar and are not listed; they still reopen by id through `session/load`
+
+### Changed
+
+- **The commit trailer names the siGit Code version.** Commits siGit Code
+  makes now end with `Co-Authored-By: siGit Code v<version> <noreply@sigit.si>`
+  instead of the bare name. The model changes from session to session; the
+  version tells you which build of the agent wrote the commit. GitHub still
+  credits the co-author, since it matches on the address. A commit that
+  already carries a siGit Code trailer from an older version is left alone.
   
   
 ## 1.5.10

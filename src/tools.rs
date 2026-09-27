@@ -2009,9 +2009,16 @@ fn kill_shell_tree(child: &mut std::process::Child) {
 /// alongside the human author; `noreply@sigit.si`
 /// is the noreply address for the <https://github.com/sigitc> account
 /// ("siGit Code"), so the co-author is rendered with that account's avatar
-/// and profile link. The system prompt asks the model to add this itself;
-/// [`ensure_commit_co_author`] is the safety net when it forgets.
-pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <noreply@sigit.si>";
+/// and profile link. GitHub matches on the address, so the name is free to
+/// carry the harness version: the model behind a commit changes from one
+/// session to the next, but the version says which siGit Code made it. The
+/// system prompt asks the model to add this itself; [`ensure_commit_co_author`]
+/// is the safety net when it forgets.
+pub const COMMIT_CO_AUTHOR_TRAILER: &str = concat!(
+    "Co-Authored-By: siGit Code v",
+    env!("CARGO_PKG_VERSION"),
+    " <noreply@sigit.si>"
+);
 
 /// Run `git <args>` in `cwd`, returning trimmed stdout on success.
 ///
@@ -3358,6 +3365,54 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn co_author_trailer_names_the_harness_version() {
+        assert_eq!(
+            COMMIT_CO_AUTHOR_TRAILER,
+            format!(
+                "Co-Authored-By: siGit Code v{} <noreply@sigit.si>",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn run_command_keeps_a_trailer_from_an_older_version() {
+        let dir = init_test_repo("coauthor_older");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        // Same cmd /C constraint as above: the trailer goes in with direct git
+        // args. Commits made before the version was added, or by another
+        // release, already credit siGit Code and must not get a second line.
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update file\n\nCo-Authored-By: siGit Code <noreply@sigit.si>",
+            ],
+        );
+        let args = serde_json::json!({
+            "command": "git commit --amend --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message.matches("Co-Authored-By: siGit Code").count(),
+            1,
+            "trailer must not be duplicated: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

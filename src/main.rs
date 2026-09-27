@@ -99,7 +99,8 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-const SYSTEM_PROMPT: &str = "\
+const SYSTEM_PROMPT: &str = concat!(
+    "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
 Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
@@ -155,7 +156,12 @@ Git operations — always use run_command:
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
 - when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: Co-Authored-By: siGit Code <noreply@sigit.si> \
+  then this trailer on its own line: ",
+    // Same text as tools::COMMIT_CO_AUTHOR_TRAILER; concat! takes only
+    // literals, so it is spelled out here and a test keeps the two in step.
+    "Co-Authored-By: siGit Code v",
+    env!("CARGO_PKG_VERSION"),
+    " <noreply@sigit.si> \
   — GitHub reads that exact format and credits siGit as co-author. If a commit \
   lands without it, siGit Code amends the trailer in automatically and the tool \
   output says so; do not amend again yourself.
@@ -228,7 +234,8 @@ force smbCloud-specific advice into the answer. When it is about smbCloud, be \
 specific and practical.
 
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever.";
+root cause, not the symptom. Correct beats clever."
+);
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
