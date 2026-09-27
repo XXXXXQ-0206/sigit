@@ -14,6 +14,16 @@
   from the first user message — and a request may filter on `cwd` so one
   project is never offered another's threads. Threads saved before this have no
   sidecar and are not listed; they still reopen by id through `session/load`
+
+### Fixed
+
+- **The co-author trailer ends a conflicted merge commit.** Finishing a
+  conflicted merge with `git commit --no-edit` keeps git's `# Conflicts:` list
+  in the message, since no editor runs to strip it. When siGit Code then added
+  its trailer, the trailer went in above that list, so it was no longer the last
+  paragraph and GitHub didn't credit the co-author. The amend now drops the
+  leftover comment block and puts the trailer last. It also fixes a commit
+  that already has the trailer but still ends in that block.
   
   
 ## 1.5.10
