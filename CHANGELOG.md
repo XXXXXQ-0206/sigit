@@ -17,10 +17,13 @@
 
 ### Changed
 
-- **The commit trailer names the siGit Code version.** Commits siGit Code
-  makes now end with `Co-Authored-By: siGit Code v<version> <noreply@sigit.si>`
-  instead of the bare name. The model changes from session to session; the
-  version tells you which build of the agent wrote the commit. GitHub still
+- **The commit trailer names the siGit Code version and surface.** Commits
+  siGit Code makes now end with
+  `Co-Authored-By: siGit Code v<version>-<surface> <noreply@sigit.si>` instead
+  of the bare name, where the surface is `acp` (an editor), `tui` (the
+  terminal UI), or `headless` (`sigit run`). The model changes from session to
+  session; the version and surface tell you which build of the agent wrote the
+  commit and how it was driven. GitHub still
   credits the co-author, since it matches on the address. A commit that
   already carries a siGit Code trailer from an older version is left alone.
   
