@@ -2016,7 +2016,7 @@ fn kill_shell_tree(child: &mut std::process::Child) {
 /// is the safety net when it forgets.
 ///
 /// The version carries a suffix naming the surface the process serves
-/// (`v1.5.10-acp`, `v1.5.10-tui`), set once at startup by [`set_surface`], so
+/// (`v1.5.11-acp`, `v1.5.11-tui`), set once at startup by [`set_surface`], so
 /// a commit also says whether it came from the editor or the terminal.
 pub fn commit_co_author_trailer() -> String {
     co_author_trailer_for(SURFACE.get().copied())
