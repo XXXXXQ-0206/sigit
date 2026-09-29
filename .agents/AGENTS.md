@@ -139,7 +139,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
-  `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
+  `Co-Authored-By: siGit Code` trailer (`commit_co_author_trailer()`, which reads
+  `siGit Code v<version>-<acp|tui|headless>` from the surface `main` sets via `set_surface`), it amends the trailer in —
   unless the commit already exists on a remote, which is never rewritten. Every child process it
   spawns (`spawn_shell`, the `git` helpers, and `hooks.rs`) sets `stdin` to null and never
   inherits it: in ACP mode sigit's stdin is the JSON-RPC pipe from the editor, so a command that

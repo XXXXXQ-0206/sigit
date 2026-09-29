@@ -269,7 +269,7 @@ pub async fn run(config: HeadlessConfig) -> i32 {
     // Same always-on project context the other surfaces inject: cwd guidance
     // plus AGENTS.md / CLAUDE.md instruction files.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut system_prompt = crate::system_prompt_for_model(true).to_string();
+    let mut system_prompt = crate::system_prompt_for_model(true);
     system_prompt.push_str("\n\n");
     system_prompt.push_str(&crate::session_context_message(
         &cwd,

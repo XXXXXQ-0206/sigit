@@ -2765,7 +2765,7 @@ mod tui {
         // directory so the on-device model gets the same always-on context the
         // cloud and ACP paths get.
         let system_prompt = {
-            let base = crate::system_prompt_for_model(model.tool_calling).to_string();
+            let base = crate::system_prompt_for_model(model.tool_calling);
             match std::env::current_dir()
                 .ok()
                 .and_then(|cwd| crate::instructions::load_project_instructions(&cwd))
@@ -2968,8 +2968,7 @@ mod tui {
                                 app.close_model_picker();
                                 match crate::provider::cloud_tier_provider(&tier) {
                                     Some(provider) => {
-                                        let system_prompt =
-                                            crate::system_prompt_for_model(true).to_string();
+                                        let system_prompt = crate::system_prompt_for_model(true);
                                         app.backend = Arc::new(OpenAiBackend::new(
                                             provider.base_url,
                                             provider.api_key,
