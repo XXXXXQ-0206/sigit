@@ -2084,17 +2084,52 @@ fn git_head(cwd: &Path) -> Option<String> {
     git_stdout(cwd, &["rev-parse", "HEAD"])
 }
 
+/// Drop the comment block git leaves at the end of a message it wrote itself.
+///
+/// `git commit --no-edit` after a conflicted merge takes `MERGE_MSG` as is,
+/// and with no editor involved git only cleans up whitespace, so the
+/// `# Conflicts:` list stays in the commit. Any trailer after it is no longer
+/// in the last paragraph, and GitHub stops seeing it. Only trailing
+/// paragraphs made entirely of `#` lines go; a `#` line inside the message
+/// (a Markdown heading in a `-m` body, say) is left alone. Paragraphs are
+/// split on any blank line, so a run of them or CRLF endings work too.
+fn strip_trailing_comment_block(message: &str) -> &str {
+    let mut rest = message.trim_end();
+    loop {
+        // Byte offset just past the last blank line, i.e. where the final
+        // paragraph starts. `rest` never ends in one, so that paragraph
+        // is non-empty.
+        let mut split = None;
+        let mut offset = 0;
+        for line in rest.split_inclusive('\n') {
+            offset += line.len();
+            if line.trim().is_empty() {
+                split = Some(offset);
+            }
+        }
+        let Some(split) = split else { return rest };
+        if rest[split..].lines().all(|line| line.starts_with('#')) {
+            rest = rest[..split].trim_end();
+        } else {
+            return rest;
+        }
+    }
+}
+
 /// Deterministic co-author attribution: if the commit at HEAD lacks the
 /// siGit Code trailer, amend it in (via `git commit --amend --trailer`, which
-/// places it after a blank line — the format GitHub detects). Never rewrites
-/// a commit that is already on a remote. Returns a note describing the amend
-/// so the model and user can see it happened.
+/// places it after a blank line — the format GitHub detects). A leftover
+/// comment block from git (see [`strip_trailing_comment_block`]) is removed in
+/// the same amend, since it would otherwise sit below the trailer and hide it.
+/// Never rewrites a commit that is already on a remote. Returns a note
+/// describing the amend so the model and user can see it happened.
 fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
     let message = git_stdout(cwd, &["log", "-1", "--format=%B"])?;
-    if message
+    let cleaned = strip_trailing_comment_block(&message);
+    let has_trailer = cleaned
         .to_lowercase()
-        .contains("co-authored-by: sigit code")
-    {
+        .contains("co-authored-by: sigit code");
+    if has_trailer && cleaned == message {
         return None;
     }
     // Amending changes the commit id; a commit that any remote ref already
@@ -2103,10 +2138,18 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
         Some(remotes) if remotes.is_empty() => {}
         _ => return None,
     }
+    // The message is passed explicitly rather than with --no-edit so the
+    // comment block is gone before git decides where the trailer goes.
+    // `whitespace` is what git already applied to a message it didn't edit.
     let trailer = commit_co_author_trailer();
-    let amend = Command::new("git")
-        .args(["commit", "--amend", "--no-edit", "--trailer"])
-        .arg(&trailer)
+    let mut amend = Command::new("git");
+    amend
+        .args(["commit", "--amend", "--cleanup=whitespace", "-m"])
+        .arg(cleaned);
+    if !has_trailer {
+        amend.arg("--trailer").arg(&trailer);
+    }
+    let amend = amend
         .stdin(std::process::Stdio::null())
         .current_dir(cwd)
         .output()
@@ -2116,10 +2159,16 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
             "appended co-author trailer to the new commit in {}",
             cwd.display()
         );
-        Some(format!(
-            "[siGit Code] The new commit was amended to append the co-author trailer \
-             \"{trailer}\" (its hash changed)."
-        ))
+        Some(if has_trailer {
+            "[siGit Code] The new commit was amended to drop git's leftover comment lines, \
+             which sat below the co-author trailer and hid it (its hash changed)."
+                .to_string()
+        } else {
+            format!(
+                "[siGit Code] The new commit was amended to append the co-author trailer \
+                 \"{trailer}\" (its hash changed)."
+            )
+        })
     } else {
         log::warn!(
             "could not append co-author trailer in {}: {}",
@@ -3306,6 +3355,126 @@ mod tests {
             started.elapsed()
         );
         assert!(result.contains("no output"), "unexpected result: {result}");
+    }
+
+    #[test]
+    fn strip_trailing_comment_block_only_drops_trailing_comment_paragraphs() {
+        assert_eq!(
+            strip_trailing_comment_block("Merge branch 'side'\n\n# Conflicts:\n#\tfile.txt\n"),
+            "Merge branch 'side'"
+        );
+        assert_eq!(
+            strip_trailing_comment_block(
+                "Merge\n\nCo-Authored-By: siGit Code <noreply@sigit.si>\n\n# Conflicts:\n#\tf"
+            ),
+            "Merge\n\nCo-Authored-By: siGit Code <noreply@sigit.si>"
+        );
+        // A heading inside the body, or a paragraph that only starts with
+        // one, is the author's text.
+        let body = "Title\n\n## Why\n\nBecause\n\n# Note\nnot a comment";
+        assert_eq!(strip_trailing_comment_block(body), body);
+        assert_eq!(strip_trailing_comment_block("# only"), "# only");
+        // Extra blank lines, whitespace-only lines, and CRLF still separate
+        // paragraphs.
+        assert_eq!(
+            strip_trailing_comment_block("Merge\n\n\n\n# Conflicts:\n#\tf\n"),
+            "Merge"
+        );
+        assert_eq!(
+            strip_trailing_comment_block("Merge\n \t\n# Conflicts:\n#\tf"),
+            "Merge"
+        );
+        assert_eq!(
+            strip_trailing_comment_block("Merge\r\n\r\n# Conflicts:\r\n#\tf\r\n"),
+            "Merge"
+        );
+        let crlf = "Title\r\n\r\n# Note\r\nnot a comment\r\n";
+        assert_eq!(strip_trailing_comment_block(crlf), crlf.trim_end());
+    }
+
+    /// Start a merge of `side` into `main` that conflicts on file.txt and
+    /// resolve it, leaving the merge ready to commit.
+    fn stage_resolved_merge_conflict(dir: &Path) {
+        test_git(dir, &["switch", "-q", "-c", "side"]);
+        fs::write(dir.join("file.txt"), "side\n").unwrap();
+        test_git(dir, &["commit", "-q", "-am", "Side"]);
+        test_git(dir, &["switch", "-q", "main"]);
+        fs::write(dir.join("file.txt"), "main\n").unwrap();
+        test_git(dir, &["commit", "-q", "-am", "Main"]);
+        let merge = Command::new("git")
+            .args(["merge", "-q", "side"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge should conflict");
+        fs::write(dir.join("file.txt"), "both\n").unwrap();
+        test_git(dir, &["add", "file.txt"]);
+    }
+
+    /// Issue #74's screenshot: the model finished a conflicted merge with
+    /// `git commit --no-edit`, git kept its `# Conflicts:` block, and the
+    /// amended trailer landed above it where GitHub doesn't look.
+    #[test]
+    fn run_command_puts_trailer_last_on_a_conflicted_merge() {
+        let dir = init_test_repo("coauthor_merge_conflict");
+        stage_resolved_merge_conflict(&dir);
+        let args = serde_json::json!({
+            "command": "git commit --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(result.contains("co-author trailer"), "got: {result}");
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message,
+            format!("Merge branch 'side'\n\n{}", commit_co_author_trailer())
+        );
+        let parents = git_stdout(&dir, &["log", "-1", "--format=%P"]).unwrap();
+        assert_eq!(parents.split(' ').count(), 2, "still a merge: {parents}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_drops_comment_block_below_an_existing_trailer() {
+        let dir = init_test_repo("coauthor_merge_trailer_hidden");
+        stage_resolved_merge_conflict(&dir);
+        // The layout from the issue, trailer present but not last. Written
+        // with direct git args because cmd /C can't pass the trailer through.
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "--cleanup=verbatim",
+                "-m",
+                &format!(
+                    "Merge branch 'side'\n\n{}\n\n# Conflicts:\n#\tfile.txt",
+                    commit_co_author_trailer()
+                ),
+            ],
+        );
+        // Change the tree too, or an amend in the same second can reproduce
+        // the same commit id and HEAD wouldn't move.
+        fs::write(dir.join("file.txt"), "both, fixed\n").unwrap();
+        test_git(&dir, &["add", "file.txt"]);
+        let args = serde_json::json!({
+            "command": "git commit --amend --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(result.contains("leftover comment lines"), "got: {result}");
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message,
+            format!("Merge branch 'side'\n\n{}", commit_co_author_trailer())
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

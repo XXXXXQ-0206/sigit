@@ -26,6 +26,16 @@
   commit and how it was driven. GitHub still
   credits the co-author, since it matches on the address. A commit that
   already carries a siGit Code trailer from an older version is left alone.
+
+### Fixed
+
+- **The co-author trailer ends a conflicted merge commit.** Finishing a
+  conflicted merge with `git commit --no-edit` keeps git's `# Conflicts:` list
+  in the message, since no editor runs to strip it. When siGit Code then added
+  its trailer, the trailer went in above that list, so it was no longer the last
+  paragraph and GitHub didn't credit the co-author. The amend now drops the
+  leftover comment block and puts the trailer last. It also fixes a commit
+  that already has the trailer but still ends in that block.
   
   
 ## 1.5.10
