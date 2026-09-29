@@ -2009,9 +2009,58 @@ fn kill_shell_tree(child: &mut std::process::Child) {
 /// alongside the human author; `noreply@sigit.si`
 /// is the noreply address for the <https://github.com/sigitc> account
 /// ("siGit Code"), so the co-author is rendered with that account's avatar
-/// and profile link. The system prompt asks the model to add this itself;
-/// [`ensure_commit_co_author`] is the safety net when it forgets.
-pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <noreply@sigit.si>";
+/// and profile link. GitHub matches on the address, so the name is free to
+/// carry the harness version: the model behind a commit changes from one
+/// session to the next, but the version says which siGit Code made it. The
+/// system prompt asks the model to add this itself; [`ensure_commit_co_author`]
+/// is the safety net when it forgets.
+///
+/// The version carries a suffix naming the surface the process serves
+/// (`v1.5.10-acp`, `v1.5.10-tui`), set once at startup by [`set_surface`], so
+/// a commit also says whether it came from the editor or the terminal.
+pub fn commit_co_author_trailer() -> String {
+    co_author_trailer_for(SURFACE.get().copied())
+}
+
+fn co_author_trailer_for(surface: Option<Surface>) -> String {
+    let suffix = surface.map_or(String::new(), |surface| format!("-{}", surface.tag()));
+    format!(
+        "Co-Authored-By: siGit Code v{}{suffix} <noreply@sigit.si>",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Which way this process is exposed. One binary serves all of them, chosen in
+/// `main` before any prompt is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// Agent Client Protocol over stdio (editors).
+    Acp,
+    /// The interactive terminal UI.
+    // Unix-only, like the TUI itself.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Tui,
+    /// `sigit run` / `sigit -p`.
+    Headless,
+}
+
+impl Surface {
+    fn tag(self) -> &'static str {
+        match self {
+            Surface::Acp => "acp",
+            Surface::Tui => "tui",
+            Surface::Headless => "headless",
+        }
+    }
+}
+
+static SURFACE: OnceLock<Surface> = OnceLock::new();
+
+/// Record the surface this process serves. The first call wins; `main` makes
+/// it once, before anything builds a system prompt or runs a tool.
+pub fn set_surface(surface: Surface) {
+    let _ = SURFACE.set(surface);
+}
 
 /// Run `git <args>` in `cwd`, returning trimmed stdout on success.
 ///
@@ -2054,9 +2103,10 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
         Some(remotes) if remotes.is_empty() => {}
         _ => return None,
     }
+    let trailer = commit_co_author_trailer();
     let amend = Command::new("git")
         .args(["commit", "--amend", "--no-edit", "--trailer"])
-        .arg(COMMIT_CO_AUTHOR_TRAILER)
+        .arg(&trailer)
         .stdin(std::process::Stdio::null())
         .current_dir(cwd)
         .output()
@@ -2068,7 +2118,7 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
         );
         Some(format!(
             "[siGit Code] The new commit was amended to append the co-author trailer \
-             \"{COMMIT_CO_AUTHOR_TRAILER}\" (its hash changed)."
+             \"{trailer}\" (its hash changed)."
         ))
     } else {
         log::warn!(
@@ -3274,12 +3324,13 @@ mod tests {
         assert!(result.contains("co-author trailer"), "got: {result}");
 
         let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        let trailer = commit_co_author_trailer();
         assert!(
-            message.ends_with(COMMIT_CO_AUTHOR_TRAILER),
+            message.ends_with(&trailer),
             "trailer must be the last line: {message:?}"
         );
         assert!(
-            message.contains(&format!("\n\n{COMMIT_CO_AUTHOR_TRAILER}")),
+            message.contains(&format!("\n\n{trailer}")),
             "trailer needs a blank line before it for GitHub to detect it: {message:?}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3301,7 +3352,7 @@ mod tests {
                 "commit",
                 "-q",
                 "-m",
-                &format!("Update file\n\n{COMMIT_CO_AUTHOR_TRAILER}"),
+                &format!("Update file\n\n{}", commit_co_author_trailer()),
             ],
         );
         let args = serde_json::json!({
@@ -3358,6 +3409,66 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn co_author_trailer_names_the_harness_version_and_surface() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            co_author_trailer_for(Some(Surface::Acp)),
+            format!("Co-Authored-By: siGit Code v{version}-acp <noreply@sigit.si>")
+        );
+        assert_eq!(
+            co_author_trailer_for(Some(Surface::Tui)),
+            format!("Co-Authored-By: siGit Code v{version}-tui <noreply@sigit.si>")
+        );
+        assert_eq!(
+            co_author_trailer_for(Some(Surface::Headless)),
+            format!("Co-Authored-By: siGit Code v{version}-headless <noreply@sigit.si>")
+        );
+        // Before `main` picks a surface (tests, or a tool run outside a
+        // session) the version stands alone rather than guessing.
+        assert_eq!(
+            co_author_trailer_for(None),
+            format!("Co-Authored-By: siGit Code v{version} <noreply@sigit.si>")
+        );
+    }
+
+    #[test]
+    fn run_command_keeps_a_trailer_from_an_older_version() {
+        let dir = init_test_repo("coauthor_older");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        // Same cmd /C constraint as above: the trailer goes in with direct git
+        // args. Commits made before the version was added, or by another
+        // release, already credit siGit Code and must not get a second line.
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update file\n\nCo-Authored-By: siGit Code <noreply@sigit.si>",
+            ],
+        );
+        let args = serde_json::json!({
+            "command": "git commit --amend --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message.matches("Co-Authored-By: siGit Code").count(),
+            1,
+            "trailer must not be duplicated: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -99,7 +99,12 @@ use tracing_subscriber::{EnvFilter, fmt as tracing_fmt};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
-const SYSTEM_PROMPT: &str = "\
+/// Stands in for the commit trailer inside [`SYSTEM_PROMPT`]; see
+/// [`system_prompt_for_model`].
+const CO_AUTHOR_TRAILER_PLACEHOLDER: &str = "{commit_co_author_trailer}";
+
+const SYSTEM_PROMPT: &str = concat!(
+    "\
 Your name is siGit — lowercase 's', uppercase 'G', no spaces. \
 Not 'SiGit', not 'Sigit'. Only say your name if the user asks who you are.
 
@@ -155,7 +160,12 @@ Git operations — always use run_command:
 - if a clone or init fails, check the error, fix the cause (wrong path, missing \
   directory, permissions), and retry
 - when you create a commit, always end the commit message with a blank line and \
-  then this trailer on its own line: Co-Authored-By: siGit Code <noreply@sigit.si> \
+  then this trailer on its own line: ",
+    // CO_AUTHOR_TRAILER_PLACEHOLDER (concat! takes only literals), filled in
+    // by `system_prompt_for_model` with tools::commit_co_author_trailer(),
+    // which depends on the surface picked at startup.
+    "{commit_co_author_trailer}",
+    " \
   — GitHub reads that exact format and credits siGit as co-author. If a commit \
   lands without it, siGit Code amends the trailer in automatically and the tool \
   output says so; do not amend again yourself.
@@ -228,7 +238,8 @@ force smbCloud-specific advice into the answer. When it is about smbCloud, be \
 specific and practical.
 
 Be direct and brief. Write clean, idiomatic code. When debugging, go for the \
-root cause, not the symptom. Correct beats clever.";
+root cause, not the symptom. Correct beats clever."
+);
 
 /// shorter prompt for models without tool calling (e.g. DeepSeek Coder v1).
 /// the full [`SYSTEM_PROMPT`] wastes context and confuses them.
@@ -239,11 +250,14 @@ Answer any question the user asks — programming, general knowledge, or casual 
 When debugging, address the root cause, not the symptom. \
 Be direct and brief.";
 
-pub(crate) fn system_prompt_for_model(tool_calling: bool) -> &'static str {
+pub(crate) fn system_prompt_for_model(tool_calling: bool) -> String {
     if tool_calling {
-        SYSTEM_PROMPT
+        SYSTEM_PROMPT.replace(
+            CO_AUTHOR_TRAILER_PLACEHOLDER,
+            &tools::commit_co_author_trailer(),
+        )
     } else {
-        SIMPLE_SYSTEM_PROMPT
+        SIMPLE_SYSTEM_PROMPT.to_string()
     }
 }
 
@@ -911,7 +925,7 @@ impl SiGitAgent {
         };
 
         let loader_engine = Arc::clone(&self.engine);
-        let loader_system_prompt = system_prompt_for_model(tool_calling).to_string();
+        let loader_system_prompt = system_prompt_for_model(tool_calling);
         let model_ready = Arc::clone(&self.model_ready);
         let model_load_error = Arc::clone(&self.model_load_error);
 
@@ -1342,7 +1356,7 @@ impl SiGitAgent {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         let loader_engine = Arc::clone(&self.engine);
         let loader_config = new_config.clone();
-        let loader_system_prompt = system_prompt_for_model(new_tool_calling).to_string();
+        let loader_system_prompt = system_prompt_for_model(new_tool_calling);
         let loader_sampling = sampling;
 
         std::thread::spawn(move || {
@@ -2662,7 +2676,7 @@ impl SiGitAgent {
                 &cwd,
                 &workspace::additional_roots(),
             )),
-            None => system_prompt_for_model(true).to_string(),
+            None => system_prompt_for_model(true),
         };
         let cloud_backend: Arc<dyn InferenceBackend> = Arc::new(OpenAiBackend::new(
             cfg.base_url,
@@ -4105,7 +4119,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                     provider.base_url,
                     provider.api_key,
                     provider.model,
-                    Some(with_instructions(SYSTEM_PROMPT.to_string())),
+                    Some(with_instructions(system_prompt_for_model(true))),
                 )) as Arc<dyn InferenceBackend>;
                 (backend, label)
             }
@@ -4135,7 +4149,7 @@ async fn run_interactive(tty: std::fs::File, mut cleanup_tty: std::fs::File) -> 
                             provider.base_url,
                             provider.api_key,
                             provider.model,
-                            Some(with_instructions(SYSTEM_PROMPT.to_string())),
+                            Some(with_instructions(system_prompt_for_model(true))),
                         )) as Arc<dyn InferenceBackend>;
                         (backend, label)
                     }
@@ -4288,7 +4302,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
             cfg.base_url,
             cfg.api_key,
             cfg.model,
-            Some(system_prompt_for_model(true).to_string()),
+            Some(system_prompt_for_model(true)),
         ));
         *state.backend.lock().await = override_backend;
     } else {
@@ -4548,6 +4562,7 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
         Ok(true) => {
+            tools::set_surface(tools::Surface::Acp);
             init_logging(false);
             setup::setup_shared_model_cache();
             mcp::init().await;
@@ -4562,6 +4577,7 @@ async fn main() -> anyhow::Result<()> {
     match headless::parse_args(&cli_args) {
         Ok(None) => {}
         Ok(Some(config)) => {
+            tools::set_surface(tools::Surface::Headless);
             // Logs to stderr; stdout stays clean for the assistant's answer.
             init_logging(false);
             // Enter --cwd before anything loads, so instruction files and
@@ -4610,6 +4626,7 @@ async fn main() -> anyhow::Result<()> {
         // must redirect before any library code touches stdout
         #[cfg(unix)]
         {
+            tools::set_surface(tools::Surface::Tui);
             let (tty, cleanup_tty) = redirect_output_to_log()?;
             init_logging(true);
             setup::setup_shared_model_cache();
@@ -4625,6 +4642,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // ACP mode: keep stdout untouched for protocol JSON only.
         // Logs already go to stderr via `init_logging(false)`.
+        tools::set_surface(tools::Surface::Acp);
         init_logging(false);
         setup::setup_shared_model_cache();
         // Best-effort MCP discovery (incl. the official server) before serving.
@@ -5189,10 +5207,12 @@ mod tests {
         // The prompt instructs the model with the exact trailer that
         // `tools::ensure_commit_co_author` enforces; if the two drift apart the
         // safety net would re-amend commits the model already attributed.
+        let prompt = system_prompt_for_model(true);
         assert!(
-            SYSTEM_PROMPT.contains(tools::COMMIT_CO_AUTHOR_TRAILER),
-            "SYSTEM_PROMPT must quote tools::COMMIT_CO_AUTHOR_TRAILER verbatim"
+            prompt.contains(&tools::commit_co_author_trailer()),
+            "the system prompt must quote tools::commit_co_author_trailer() verbatim"
         );
+        assert!(!prompt.contains(CO_AUTHOR_TRAILER_PLACEHOLDER));
     }
 
     #[test]

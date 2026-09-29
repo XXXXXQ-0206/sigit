@@ -2765,7 +2765,7 @@ mod tui {
         // (AGENTS.md / CLAUDE.md) so the on-device model gets the same always-on
         // context the cloud and ACP paths get.
         let system_prompt =
-            crate::with_launch_context(crate::system_prompt_for_model(model.tool_calling));
+            crate::with_launch_context(&crate::system_prompt_for_model(model.tool_calling));
         let engine_handle = Arc::clone(&engine);
         let tool_calling = model.tool_calling;
         std::thread::spawn(move || {
@@ -2961,7 +2961,7 @@ mod tui {
                                 match crate::provider::cloud_tier_provider(&tier) {
                                     Some(provider) => {
                                         let system_prompt = crate::with_launch_context(
-                                            crate::system_prompt_for_model(true),
+                                            &crate::system_prompt_for_model(true),
                                         );
                                         app.backend = Arc::new(OpenAiBackend::new(
                                             provider.base_url,
