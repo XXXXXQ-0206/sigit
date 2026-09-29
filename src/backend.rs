@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use onde::inference::{ChatEngine, ChatMessage, ChatRole, ToolDefinition};
+use onde::inference::{ChatEngine, ChatMessage, ChatRole, EngineStatus, ToolDefinition};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -207,11 +207,54 @@ pub trait InferenceBackend: Send + Sync {
 /// On-device inference. A thin adapter over `onde::ChatEngine`.
 pub struct LocalBackend {
     engine: Arc<ChatEngine>,
+    /// History restored before an on-device model is loaded. Onde ignores
+    /// `push_history` while unloaded, so keep the snapshot here until the
+    /// engine can accept it instead of silently dropping a loaded session.
+    pending_history: Mutex<Option<Vec<serde_json::Value>>>,
 }
 
 impl LocalBackend {
     pub fn new(engine: Arc<ChatEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            pending_history: Mutex::new(None),
+        }
+    }
+
+    async fn apply_pending_history(&self) -> Result<(), BackendError> {
+        if self.pending_history.lock().await.is_none() {
+            return Ok(());
+        }
+        let status = self.engine.info().await.status;
+        if status != EngineStatus::Ready {
+            return Err(format!(
+                "on-device model is not ready to restore session history (status: {status})"
+            ));
+        }
+        let Some(history) = self.pending_history.lock().await.take() else {
+            return Ok(());
+        };
+
+        self.engine.clear_history().await;
+        for entry in history {
+            let role = entry["role"].as_str().unwrap_or("");
+            let content = entry["content"].as_str().unwrap_or("").to_string();
+            // Tool-call-only assistant entries and empty tool results carry no
+            // text a plain chat history can replay; drop them.
+            if content.is_empty() && role != "user" && role != "system" {
+                continue;
+            }
+            let message = match role {
+                "system" => ChatMessage::system(content),
+                "user" => ChatMessage::user(content),
+                "assistant" => ChatMessage::assistant(content),
+                // Tool results flatten to plain text (MVP; acceptable loss).
+                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
+                _ => continue,
+            };
+            self.engine.push_history(message).await;
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +277,7 @@ impl InferenceBackend for LocalBackend {
         tools: &[ToolSpec],
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        self.apply_pending_history().await?;
         // onde's tool-aware path is non-streaming: it has to buffer the whole
         // reply to detect tool calls. We can only stream when no tools are on
         // offer (a plain answer), which is exactly the tools-disabled case.
@@ -264,6 +308,7 @@ impl InferenceBackend for LocalBackend {
         allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        self.apply_pending_history().await?;
         let onde_results: Vec<onde::inference::ToolResult> = results
             .into_iter()
             .map(|result| onde::inference::ToolResult {
@@ -306,6 +351,9 @@ impl InferenceBackend for LocalBackend {
     }
 
     async fn history_snapshot(&self) -> Vec<serde_json::Value> {
+        if let Some(history) = self.pending_history.lock().await.as_ref() {
+            return history.clone();
+        }
         // onde's `history()` already flattens tool entries: assistant tool
         // calls become plain assistant text and tool results are omitted, so
         // the snapshot is lossy for tool-heavy turns (acceptable in this MVP).
@@ -323,28 +371,16 @@ impl InferenceBackend for LocalBackend {
     }
 
     async fn restore_history(&self, history: Vec<serde_json::Value>) {
-        self.engine.clear_history().await;
-        for entry in history {
-            let role = entry["role"].as_str().unwrap_or("");
-            let content = entry["content"].as_str().unwrap_or("").to_string();
-            // Tool-call-only assistant entries and empty tool results carry no
-            // text a plain chat history can replay; drop them.
-            if content.is_empty() && role != "user" && role != "system" {
-                continue;
-            }
-            let message = match role {
-                "system" => ChatMessage::system(content),
-                "user" => ChatMessage::user(content),
-                "assistant" => ChatMessage::assistant(content),
-                // Tool results flatten to plain text (MVP; acceptable loss).
-                "tool" => ChatMessage::user(format!("[tool result]\n{content}")),
-                _ => continue,
-            };
-            self.engine.push_history(message).await;
+        *self.pending_history.lock().await = Some(history);
+        if self.engine.info().await.status == EngineStatus::Ready {
+            // Ready was just observed, so failure here can only mean a status
+            // transition; keep the pending copy for the next inference call.
+            let _ = self.apply_pending_history().await;
         }
     }
 
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
+        self.apply_pending_history().await?;
         let snapshot = self.engine.history().await;
         // One plain (tool-free) inference round produces the summary. On error
         // history is untouched — send_message only mutates it on success, and
@@ -493,12 +529,58 @@ impl OpenAiBackend {
     /// `tools` is always the known catalog, while `allow_tool_calls` determines
     /// whether it is advertised to the model and whether returned calls may run.
     /// Streams via SSE when `sink` is set; otherwise reads a single JSON response.
+    ///
+    /// A reply whose only attempt at a tool call was a block that couldn't be
+    /// parsed gets one retry: the model is told the call didn't run and asked
+    /// to make it again through the structured interface. Without that the
+    /// turn ends on whatever prose preceded the broken block, and the call is
+    /// silently lost.
     async fn complete(
         &self,
         tools: &[ToolSpec],
         allow_tool_calls: bool,
         sink: Option<&TokenSink>,
     ) -> Result<TurnResult, BackendError> {
+        let (result, malformed) = self.request(tools, allow_tool_calls, sink).await?;
+        if malformed == 0 || !allow_tool_calls || !result.tool_calls.is_empty() {
+            return Ok(result);
+        }
+
+        log::warn!(
+            "dropped {malformed} unparseable inline tool call(s); asking the model to retry"
+        );
+        self.history.lock().await.push(serde_json::json!({
+            "role": "user",
+            "content": MALFORMED_TOOL_CALL_RETRY,
+        }));
+        if let Some(sink) = sink
+            && !result.text.trim().is_empty()
+        {
+            // The retry's text follows what already streamed; keep it from
+            // running on into the previous sentence.
+            let _ = sink.send("\n\n".to_string());
+        }
+        let (retry, retry_malformed) = self.request(tools, allow_tool_calls, sink).await?;
+        if retry_malformed > 0 && retry.tool_calls.is_empty() {
+            log::warn!(
+                "the retry also wrote {retry_malformed} unparseable inline tool call(s); \
+                 ending the turn without them"
+            );
+        }
+        Ok(TurnResult {
+            text: join_reply_text(&result.text, &retry.text),
+            tool_calls: retry.tool_calls,
+        })
+    }
+
+    /// One chat-completion round trip. Returns the turn plus how many inline
+    /// tool-call blocks were dropped because they couldn't be parsed.
+    async fn request(
+        &self,
+        tools: &[ToolSpec],
+        allow_tool_calls: bool,
+        sink: Option<&TokenSink>,
+    ) -> Result<(TurnResult, usize), BackendError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let streaming = sink.is_some();
 
@@ -546,7 +628,7 @@ impl OpenAiBackend {
         response: reqwest::Response,
         tools: &[ToolSpec],
         allow_tool_calls: bool,
-    ) -> Result<TurnResult, BackendError> {
+    ) -> Result<(TurnResult, usize), BackendError> {
         let parsed: ChatCompletion = response
             .json()
             .await
@@ -560,7 +642,7 @@ impl OpenAiBackend {
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
 
         let mut text = message.content.clone().unwrap_or_default();
-        let tool_calls: Vec<ToolCall> = message
+        let mut tool_calls: Vec<ToolCall> = message
             .tool_calls
             .iter()
             .flatten()
@@ -571,9 +653,15 @@ impl OpenAiBackend {
             })
             .collect();
 
+        let extracted = crate::inline_tool_calls::extract(&text, tools);
+        let malformed = extracted.malformed;
+        if malformed > 0 {
+            log::warn!("dropped {malformed} unparseable inline tool call(s) from the reply");
+        }
+
         if !allow_tool_calls {
-            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
-            text = cleaned;
+            let recovered = extracted.calls;
+            text = extracted.text;
             let suppressed = tool_calls.len() + recovered.len();
             if suppressed > 0 {
                 let names = tool_calls
@@ -590,10 +678,13 @@ impl OpenAiBackend {
                 .lock()
                 .await
                 .push(streamed_assistant_history(&text, &[]));
-            return Ok(TurnResult {
-                text,
-                tool_calls: Vec::new(),
-            });
+            return Ok((
+                TurnResult {
+                    text,
+                    tool_calls: Vec::new(),
+                },
+                malformed,
+            ));
         }
 
         // Some models write a tool call out as literal `<tool_call>` text
@@ -601,7 +692,8 @@ impl OpenAiBackend {
         // Recover it, or the turn ends with the tag rendered as prose and
         // whatever the model meant to do is dropped.
         if tool_calls.is_empty() {
-            let (cleaned, recovered) = crate::inline_tool_calls::extract(&text, tools);
+            let cleaned = extracted.text;
+            let recovered = extracted.calls;
             if !recovered.is_empty() {
                 log::warn!(
                     "recovered {} tool call(s) the model emitted as text instead of a structured call",
@@ -624,17 +716,72 @@ impl OpenAiBackend {
                     .lock()
                     .await
                     .push(streamed_assistant_history(&cleaned, &tool_calls));
-                return Ok(TurnResult {
-                    text: cleaned,
-                    tool_calls,
-                });
+                return Ok((
+                    TurnResult {
+                        text: cleaned,
+                        tool_calls,
+                    },
+                    malformed,
+                ));
             }
+            if malformed > 0 {
+                // Keep the broken block out of history as well as the reply;
+                // see `inline_tool_calls` for why it poisons later turns.
+                self.push_reply_without_calls(&cleaned).await;
+                return Ok((
+                    TurnResult {
+                        text: cleaned,
+                        tool_calls,
+                    },
+                    malformed,
+                ));
+            }
+        } else if malformed > 0 || !extracted.calls.is_empty() {
+            // Structured calls arrived with inline blocks beside them. As on
+            // the streaming path, inline calls that parse run alongside the
+            // structured ones, broken blocks are dropped, and neither kind of
+            // block is left in the reply or the history.
+            let offset = tool_calls.len();
+            tool_calls.extend(
+                extracted
+                    .calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, call)| ToolCall {
+                        id: format!("call_recovered_{}", offset + index),
+                        name: call.name,
+                        arguments: call.arguments,
+                    }),
+            );
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(&extracted.text, &tool_calls));
+            return Ok((
+                TurnResult {
+                    text: extracted.text,
+                    tool_calls,
+                },
+                malformed,
+            ));
         }
 
         // Record the assistant turn so later tool results have context.
         self.history.lock().await.push(message.into_history_value());
 
-        Ok(TurnResult { text, tool_calls })
+        Ok((TurnResult { text, tool_calls }, 0))
+    }
+
+    /// Record a text-only assistant reply. An empty one is skipped: strict
+    /// endpoints reject an assistant message with neither content nor tool
+    /// calls, and there is nothing in it worth replaying.
+    async fn push_reply_without_calls(&self, text: &str) {
+        if !text.is_empty() {
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(text, &[]));
+        }
     }
 
     /// Consume an OpenAI Server-Sent Events stream, forwarding content deltas to
@@ -646,7 +793,7 @@ impl OpenAiBackend {
         sink: &TokenSink,
         tools: &[ToolSpec],
         allow_tool_calls: bool,
-    ) -> Result<TurnResult, BackendError> {
+    ) -> Result<(TurnResult, usize), BackendError> {
         use futures::StreamExt;
 
         let mut stream = response.bytes_stream();
@@ -663,6 +810,7 @@ impl OpenAiBackend {
         // already been rendered. See `inline_tool_calls`.
         let mut scanner = crate::inline_tool_calls::StreamScanner::new(tools);
         let mut recovered: Vec<ToolCall> = Vec::new();
+        let mut malformed = 0usize;
 
         while let Some(item) = stream.next().await {
             let bytes = item.map_err(|error| format!("stream read error: {error}"))?;
@@ -732,6 +880,10 @@ impl OpenAiBackend {
                                     arguments: call.arguments,
                                 });
                             }
+                            crate::inline_tool_calls::ScanEvent::Malformed(block) => {
+                                log_malformed_block(&block);
+                                malformed += 1;
+                            }
                         }
                     }
                     if cancelled {
@@ -764,10 +916,19 @@ impl OpenAiBackend {
             }
         }
 
-        // Text held back waiting on a tag that never closed is just text.
-        if let Some(leftover) = scanner.take_pending() {
-            text.push_str(&leftover);
-            let _ = sink.send(leftover);
+        // Flush what was held back. A partial marker is just text; a
+        // tool-call block that never closed is dropped like any other
+        // unparseable one.
+        match scanner.finish() {
+            Some(crate::inline_tool_calls::ScanEvent::Text(leftover)) => {
+                text.push_str(&leftover);
+                let _ = sink.send(leftover);
+            }
+            Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
+                log_malformed_block(&block);
+                malformed += 1;
+            }
+            Some(crate::inline_tool_calls::ScanEvent::ToolCall(_)) | None => {}
         }
 
         let mut tool_calls: Vec<ToolCall> = tool_accum
@@ -800,12 +961,40 @@ impl OpenAiBackend {
         }
 
         // Record the assistant turn so later tool results have context.
-        self.history
-            .lock()
-            .await
-            .push(streamed_assistant_history(&text, &tool_calls));
+        if malformed > 0 && tool_calls.is_empty() {
+            self.push_reply_without_calls(&text).await;
+        } else {
+            self.history
+                .lock()
+                .await
+                .push(streamed_assistant_history(&text, &tool_calls));
+        }
 
-        Ok(TurnResult { text, tool_calls })
+        Ok((TurnResult { text, tool_calls }, malformed))
+    }
+}
+
+/// Sent as a user turn after a reply whose tool call couldn't be parsed.
+const MALFORMED_TOOL_CALL_RETRY: &str = "[siGit Code] Your last reply tried to call a tool by \
+    writing the call out as text, and it could not be parsed, so nothing ran and the user did \
+    not see it. Do not write tool calls or tool results as text. Make the call again using the \
+    tool-calling interface, or answer in plain prose if no tool is needed.";
+
+fn log_malformed_block(block: &str) {
+    log::warn!(
+        "dropped an unparseable inline tool call ({} chars): {}",
+        block.len(),
+        block.chars().take(200).collect::<String>()
+    );
+}
+
+/// Join the visible text of a reply and its retry the way the stream showed
+/// them: as separate paragraphs.
+fn join_reply_text(first: &str, retry: &str) -> String {
+    match (first.trim().is_empty(), retry.trim().is_empty()) {
+        (true, _) => retry.to_string(),
+        (false, true) => first.to_string(),
+        (false, false) => format!("{first}\n\n{retry}"),
     }
 }
 
@@ -883,6 +1072,24 @@ impl InferenceBackend for OpenAiBackend {
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>) {
         let mut history = self.history.lock().await;
         for result in results {
+            // Cancellation races the in-flight continuation request. That
+            // request appends its tool results before awaiting HTTP, so cleanup
+            // must be safe whether cancellation won just before or just after
+            // the append.
+            let matching_call = history.iter().rposition(|message| {
+                message["role"] == "assistant"
+                    && message["tool_calls"].as_array().is_some_and(|calls| {
+                        calls.iter().any(|call| call["id"] == result.tool_call_id)
+                    })
+            });
+            let already_recorded = matching_call.is_some_and(|call_index| {
+                history[call_index + 1..].iter().any(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == result.tool_call_id
+                })
+            });
+            if already_recorded {
+                continue;
+            }
             history.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": result.tool_call_id,
@@ -1197,6 +1404,17 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
         }
     }
 
+    // Session switches happen only after the serialized turn has ended. A
+    // trailing user message therefore belongs to a cancelled/failed inference
+    // request with no answer; carrying it would make the next activation feed
+    // the model an orphaned prompt that the client considers cancelled.
+    while carried
+        .last()
+        .is_some_and(|message| message["role"] == "user")
+    {
+        carried.pop();
+    }
+
     carried
 }
 
@@ -1357,6 +1575,22 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "call_9");
         assert_eq!(last["content"], "cancelled by the user");
+
+        drop(history);
+        backend
+            .record_cancelled_tool_results(vec![ToolResult {
+                tool_call_id: "call_9".to_string(),
+                content: "duplicate cleanup".to_string(),
+            }])
+            .await;
+        let history = backend.history.lock().await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message["tool_call_id"] == "call_9")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1372,6 +1606,19 @@ mod tests {
         assert_eq!(carried.len(), 2);
         assert_eq!(carried[0]["role"], "user");
         assert_eq!(carried[1]["content"], "hi");
+    }
+
+    #[test]
+    fn carryover_drops_a_cancelled_trailing_user_message() {
+        let carried = carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            serde_json::json!({ "role": "user", "content": "completed question" }),
+            serde_json::json!({ "role": "assistant", "content": "completed answer" }),
+            serde_json::json!({ "role": "user", "content": "cancelled question" }),
+        ]);
+
+        assert_eq!(carried.len(), 2, "{carried:#?}");
+        assert_eq!(carried.last().unwrap()["content"], "completed answer");
     }
 
     #[test]
@@ -1525,21 +1772,63 @@ mod tests {
         assert_eq!(restored.history_snapshot().await, snapshot);
     }
 
+    #[tokio::test]
+    async fn local_restore_replaces_engine_history_and_system_context() {
+        let engine = Arc::new(ChatEngine::new());
+        let backend = LocalBackend::new(Arc::clone(&engine));
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "system", "content": "thread A context" }),
+                serde_json::json!({ "role": "user", "content": "thread A question" }),
+            ])
+            .await;
+
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "system", "content": "thread B context" }),
+                serde_json::json!({ "role": "user", "content": "thread B question" }),
+            ])
+            .await;
+
+        let restored = backend.history_snapshot().await;
+        assert_eq!(restored.len(), 2, "{restored:#?}");
+        assert_eq!(restored[0]["content"], "thread B context");
+        assert_eq!(restored[1]["content"], "thread B question");
+        assert!(
+            restored.iter().all(|message| !message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("thread A")),
+            "restore_history must replace, not append to, the local engine: {restored:#?}"
+        );
+
+        let error = backend
+            .send_message_with_tools("must not run", &[], None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not ready"), "{error}");
+        assert_eq!(backend.history_snapshot().await, restored);
+    }
+
     /// Minimal scripted OpenAI-compatible endpoint: accepts one HTTP request on
     /// a std listener and answers with a fixed non-streaming completion. The
     /// receiver yields the request body the backend actually put on the wire.
     fn spawn_completion_stub(
         summary: &str,
     ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        spawn_message_stub(serde_json::json!({ "role": "assistant", "content": summary }))
+    }
+
+    /// Like [`spawn_completion_stub`], answering with an arbitrary message.
+    fn spawn_message_stub(
+        message: serde_json::Value,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let body = serde_json::json!({
-            "choices": [{ "message": { "role": "assistant", "content": summary } }]
-        })
-        .to_string();
+        let body = serde_json::json!({ "choices": [{ "message": message }] }).to_string();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             // Read until the full request (headers + content-length body) is in.
@@ -1580,6 +1869,80 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (addr, receiver)
+    }
+
+    /// A structured call can come back with a broken inline block in the same
+    /// message. The call runs; the block reaches neither the reply nor the
+    /// history, where the model would read back a call that never ran.
+    #[tokio::test]
+    async fn a_broken_inline_block_beside_a_structured_call_is_dropped() {
+        let (addr, _requests) = spawn_message_stub(serde_json::json!({
+            "role": "assistant",
+            "content": "Checking.<tool_call>run_command CheckStatus=nope</tool_call>",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "run_command", "arguments": "{\"command\":\"pwd\"}" },
+            }],
+        }));
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let tools = vec![ToolSpec {
+            name: "run_command".to_string(),
+            description: "Run a command".to_string(),
+            parameters_schema: r#"{"type":"object","properties":{"command":{"type":"string"}}}"#
+                .to_string(),
+        }];
+
+        let result = backend
+            .send_message_with_tools("where am I", &tools, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "Checking.");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        let history = backend.history_snapshot().await;
+        let reply = history.last().unwrap();
+        assert_eq!(reply["content"], "Checking.");
+        assert_eq!(reply["tool_calls"][0]["id"], "call_1");
+    }
+
+    /// A structured call plus a well-formed inline block: both run, and the
+    /// inline markup leaves the reply and history, as on the streaming path.
+    #[tokio::test]
+    async fn a_well_formed_inline_block_beside_a_structured_call_also_runs() {
+        let (addr, _requests) = spawn_message_stub(serde_json::json!({
+            "role": "assistant",
+            "content": "Checking.<tool_call>run_command<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "run_command", "arguments": "{\"command\":\"pwd\"}" },
+            }],
+        }));
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+        let tools = vec![ToolSpec {
+            name: "run_command".to_string(),
+            description: "Run a command".to_string(),
+            parameters_schema: r#"{"type":"object","properties":{"command":{"type":"string"}}}"#
+                .to_string(),
+        }];
+
+        let result = backend
+            .send_message_with_tools("where am I", &tools, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "Checking.");
+        let ids: Vec<&str> = result.tool_calls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["call_1", "call_recovered_1"]);
+        assert_eq!(result.tool_calls[1].arguments, r#"{"command":"ls"}"#);
+        let history = backend.history_snapshot().await;
+        let reply = history.last().unwrap();
+        assert_eq!(reply["content"], "Checking.");
+        assert_eq!(reply["tool_calls"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

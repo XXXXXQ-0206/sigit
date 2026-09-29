@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::backend::{InferenceBackend, ToolResult, ToolSpec};
 use crate::subagents;
@@ -336,13 +336,14 @@ pub fn all_tools() -> Vec<AgentTool> {
                            call it once up front with all the steps as `pending`, then call it \
                            again whenever a step's status changes. Mark exactly one step \
                            `in_progress` at a time and `completed` as soon as it is done. \
-                           Keep the list short and outcome-focused.",
+                           Keep the list short and outcome-focused. Pass an empty list to \
+                           clear the checklist once the task is finished.",
             parameters_schema: json!({
                 "type": "object",
                 "properties": {
                     "todos": {
                         "type": "array",
-                        "description": "The full, current checklist (replaces any previous list).",
+                        "description": "The full, current checklist (replaces any previous list). An empty list clears it.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -472,15 +473,20 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
             let tool = name.to_owned();
             let arguments = arguments.to_owned();
             let running = tool.clone();
-            tokio::task::spawn_blocking(move || execute_sync_tool(&running, &arguments))
-                .await
-                // A `JoinError` means the tool panicked (or the runtime is
-                // shutting down). Report it as the tool's result rather than
-                // propagating: a panicking tool should cost the model one bad
-                // tool result, not the whole turn. Note this is strictly safer
-                // than running the tool inline, where the panic would unwind
-                // through the turn and take the ACP connection with it.
-                .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
+            // Read on this side of the thread hop, while the caller's session
+            // is still the live one.
+            let owner = active_session();
+            tokio::task::spawn_blocking(move || {
+                execute_sync_tool(&running, &arguments, owner.as_deref())
+            })
+            .await
+            // A `JoinError` means the tool panicked (or the runtime is
+            // shutting down). Report it as the tool's result rather than
+            // propagating: a panicking tool should cost the model one bad
+            // tool result, not the whole turn. Note this is strictly safer
+            // than running the tool inline, where the panic would unwind
+            // through the turn and take the ACP connection with it.
+            .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
         }
     }
 }
@@ -492,7 +498,9 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
 /// async context belongs in [`execute_tool_impl`] alongside `task` and
 /// `web_search` instead — and then owes its own answer to the question this
 /// dispatch exists for: not blocking the caller's task for its whole run.
-fn execute_sync_tool(name: &str, arguments: &str) -> String {
+///
+/// `owner` is the session the call runs for; background tasks are scoped to it.
+fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> String {
     match name {
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
@@ -506,9 +514,9 @@ fn execute_sync_tool(name: &str, arguments: &str) -> String {
         "write_todos" => exec_write_todos(arguments),
         "remember" => exec_remember(arguments),
         "delete_file" => exec_delete_file(arguments),
-        "run_command" => exec_run_command(arguments),
-        "command_output" => exec_command_output(arguments),
-        "kill_command" => exec_kill_command(arguments),
+        "run_command" => exec_run_command(arguments, owner),
+        "command_output" => exec_command_output(arguments, owner),
+        "kill_command" => exec_kill_command(arguments, owner),
         "skill" => crate::skills::activate_skill(arguments),
         _ => format!("Unknown tool: {name}"),
     }
@@ -1788,10 +1796,15 @@ fn exec_write_todos(arguments: &str) -> String {
     };
 
     let todos = match args.get("todos").and_then(Value::as_array) {
-        Some(t) if !t.is_empty() => t,
-        Some(_) => return "Error: \"todos\" must contain at least one item".to_string(),
+        Some(t) => t,
         None => return "Error: missing required parameter \"todos\"".to_string(),
     };
+    // An empty list is how the model clears a finished checklist. Rejecting
+    // it left the last plan on screen for good, since every other call has to
+    // restate at least one step.
+    if todos.is_empty() {
+        return "Task list cleared.".to_string();
+    }
 
     let mut lines = Vec::with_capacity(todos.len());
     let mut completed = 0usize;
@@ -1996,9 +2009,58 @@ fn kill_shell_tree(child: &mut std::process::Child) {
 /// alongside the human author; `noreply@sigit.si`
 /// is the noreply address for the <https://github.com/sigitc> account
 /// ("siGit Code"), so the co-author is rendered with that account's avatar
-/// and profile link. The system prompt asks the model to add this itself;
-/// [`ensure_commit_co_author`] is the safety net when it forgets.
-pub const COMMIT_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: siGit Code <noreply@sigit.si>";
+/// and profile link. GitHub matches on the address, so the name is free to
+/// carry the harness version: the model behind a commit changes from one
+/// session to the next, but the version says which siGit Code made it. The
+/// system prompt asks the model to add this itself; [`ensure_commit_co_author`]
+/// is the safety net when it forgets.
+///
+/// The version carries a suffix naming the surface the process serves
+/// (`v1.5.11-acp`, `v1.5.11-tui`), set once at startup by [`set_surface`], so
+/// a commit also says whether it came from the editor or the terminal.
+pub fn commit_co_author_trailer() -> String {
+    co_author_trailer_for(SURFACE.get().copied())
+}
+
+fn co_author_trailer_for(surface: Option<Surface>) -> String {
+    let suffix = surface.map_or(String::new(), |surface| format!("-{}", surface.tag()));
+    format!(
+        "Co-Authored-By: siGit Code v{}{suffix} <noreply@sigit.si>",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Which way this process is exposed. One binary serves all of them, chosen in
+/// `main` before any prompt is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// Agent Client Protocol over stdio (editors).
+    Acp,
+    /// The interactive terminal UI.
+    // Unix-only, like the TUI itself.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Tui,
+    /// `sigit run` / `sigit -p`.
+    Headless,
+}
+
+impl Surface {
+    fn tag(self) -> &'static str {
+        match self {
+            Surface::Acp => "acp",
+            Surface::Tui => "tui",
+            Surface::Headless => "headless",
+        }
+    }
+}
+
+static SURFACE: OnceLock<Surface> = OnceLock::new();
+
+/// Record the surface this process serves. The first call wins; `main` makes
+/// it once, before anything builds a system prompt or runs a tool.
+pub fn set_surface(surface: Surface) {
+    let _ = SURFACE.set(surface);
+}
 
 /// Run `git <args>` in `cwd`, returning trimmed stdout on success.
 ///
@@ -2022,17 +2084,52 @@ fn git_head(cwd: &Path) -> Option<String> {
     git_stdout(cwd, &["rev-parse", "HEAD"])
 }
 
+/// Drop the comment block git leaves at the end of a message it wrote itself.
+///
+/// `git commit --no-edit` after a conflicted merge takes `MERGE_MSG` as is,
+/// and with no editor involved git only cleans up whitespace, so the
+/// `# Conflicts:` list stays in the commit. Any trailer after it is no longer
+/// in the last paragraph, and GitHub stops seeing it. Only trailing
+/// paragraphs made entirely of `#` lines go; a `#` line inside the message
+/// (a Markdown heading in a `-m` body, say) is left alone. Paragraphs are
+/// split on any blank line, so a run of them or CRLF endings work too.
+fn strip_trailing_comment_block(message: &str) -> &str {
+    let mut rest = message.trim_end();
+    loop {
+        // Byte offset just past the last blank line, i.e. where the final
+        // paragraph starts. `rest` never ends in one, so that paragraph
+        // is non-empty.
+        let mut split = None;
+        let mut offset = 0;
+        for line in rest.split_inclusive('\n') {
+            offset += line.len();
+            if line.trim().is_empty() {
+                split = Some(offset);
+            }
+        }
+        let Some(split) = split else { return rest };
+        if rest[split..].lines().all(|line| line.starts_with('#')) {
+            rest = rest[..split].trim_end();
+        } else {
+            return rest;
+        }
+    }
+}
+
 /// Deterministic co-author attribution: if the commit at HEAD lacks the
 /// siGit Code trailer, amend it in (via `git commit --amend --trailer`, which
-/// places it after a blank line — the format GitHub detects). Never rewrites
-/// a commit that is already on a remote. Returns a note describing the amend
-/// so the model and user can see it happened.
+/// places it after a blank line — the format GitHub detects). A leftover
+/// comment block from git (see [`strip_trailing_comment_block`]) is removed in
+/// the same amend, since it would otherwise sit below the trailer and hide it.
+/// Never rewrites a commit that is already on a remote. Returns a note
+/// describing the amend so the model and user can see it happened.
 fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
     let message = git_stdout(cwd, &["log", "-1", "--format=%B"])?;
-    if message
+    let cleaned = strip_trailing_comment_block(&message);
+    let has_trailer = cleaned
         .to_lowercase()
-        .contains("co-authored-by: sigit code")
-    {
+        .contains("co-authored-by: sigit code");
+    if has_trailer && cleaned == message {
         return None;
     }
     // Amending changes the commit id; a commit that any remote ref already
@@ -2041,9 +2138,18 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
         Some(remotes) if remotes.is_empty() => {}
         _ => return None,
     }
-    let amend = Command::new("git")
-        .args(["commit", "--amend", "--no-edit", "--trailer"])
-        .arg(COMMIT_CO_AUTHOR_TRAILER)
+    // The message is passed explicitly rather than with --no-edit so the
+    // comment block is gone before git decides where the trailer goes.
+    // `whitespace` is what git already applied to a message it didn't edit.
+    let trailer = commit_co_author_trailer();
+    let mut amend = Command::new("git");
+    amend
+        .args(["commit", "--amend", "--cleanup=whitespace", "-m"])
+        .arg(cleaned);
+    if !has_trailer {
+        amend.arg("--trailer").arg(&trailer);
+    }
+    let amend = amend
         .stdin(std::process::Stdio::null())
         .current_dir(cwd)
         .output()
@@ -2053,10 +2159,16 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
             "appended co-author trailer to the new commit in {}",
             cwd.display()
         );
-        Some(format!(
-            "[siGit Code] The new commit was amended to append the co-author trailer \
-             \"{COMMIT_CO_AUTHOR_TRAILER}\" (its hash changed)."
-        ))
+        Some(if has_trailer {
+            "[siGit Code] The new commit was amended to drop git's leftover comment lines, \
+             which sat below the co-author trailer and hid it (its hash changed)."
+                .to_string()
+        } else {
+            format!(
+                "[siGit Code] The new commit was amended to append the co-author trailer \
+                 \"{trailer}\" (its hash changed)."
+            )
+        })
     } else {
         log::warn!(
             "could not append co-author trailer in {}: {}",
@@ -2071,7 +2183,7 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
 /// `run_in_background` is set, in which case the child is registered as a
 /// background task and polled with `command_output` / stopped with
 /// `kill_command`.
-fn exec_run_command(arguments: &str) -> String {
+fn exec_run_command(arguments: &str, owner: Option<&str>) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
         Err(err) => return format!("Error: failed to parse arguments: {err}"),
@@ -2102,7 +2214,7 @@ fn exec_run_command(arguments: &str) -> String {
     log::info!("run_command: `{command_str}` in `{cwd_str}` (background: {run_in_background})");
 
     if run_in_background {
-        return start_background_task(command_str, &cwd_path);
+        return start_background_task(command_str, &cwd_path, owner.map(str::to_string));
     }
 
     // Co-author attribution: note where HEAD is before a command that looks
@@ -2228,6 +2340,9 @@ struct BackgroundTask {
     exit_code: Option<i32>,
     /// Set when the task was stopped via `kill_command`.
     killed: bool,
+    /// The session that started the task (see [`set_active_session`]). Only
+    /// that session can poll or kill it.
+    owner: Option<String>,
 }
 
 /// Output accumulated for a background task since the last poll.
@@ -2236,6 +2351,27 @@ struct TaskOutput {
     buf: String,
     /// Whether the oldest output was dropped because `buf` hit the cap.
     dropped: bool,
+}
+
+/// The ACP session whose turn is running, or `None` outside ACP. One process
+/// serves every thread an editor has open, and task ids are small sequential
+/// numbers, so without an owner check a thread can poll or kill a task another
+/// thread started just by guessing its id.
+static ACTIVE_SESSION: RwLock<Option<String>> = RwLock::new(None);
+
+/// Record which session the next tool calls run for.
+pub fn set_active_session(session: Option<&str>) {
+    let mut guard = ACTIVE_SESSION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = session.map(str::to_string);
+}
+
+fn active_session() -> Option<String> {
+    ACTIVE_SESSION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Process-global background task table (same pattern as `mcp::MCP`).
@@ -2287,7 +2423,7 @@ fn spawn_output_reader<R: std::io::Read + Send + 'static>(
 }
 
 /// Background branch of `run_command`: spawn, register, return immediately.
-fn start_background_task(command_str: &str, cwd_path: &Path) -> String {
+fn start_background_task(command_str: &str, cwd_path: &Path, owner: Option<String>) -> String {
     let mut child = match spawn_shell(command_str, cwd_path) {
         Ok(c) => c,
         Err(err) => return format!("Error: failed to spawn command: {err}"),
@@ -2310,6 +2446,7 @@ fn start_background_task(command_str: &str, cwd_path: &Path) -> String {
             output,
             exit_code: None,
             killed: false,
+            owner,
         },
     );
 
@@ -2368,14 +2505,17 @@ fn dropped_note(dropped: bool) -> &'static str {
 }
 
 /// `command_output` tool: output since the last poll + running/exited status.
-fn exec_command_output(arguments: &str) -> String {
+fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
         Err(err) => return err,
     };
 
     let mut map = lock_tasks();
-    let Some(task) = map.get_mut(&task_id) else {
+    let Some(task) = map
+        .get_mut(&task_id)
+        .filter(|task| task.owner.as_deref() == owner)
+    else {
         return unknown_task(task_id);
     };
 
@@ -2409,14 +2549,17 @@ fn exec_command_output(arguments: &str) -> String {
 }
 
 /// `kill_command` tool: stop a background task and report its output tail.
-fn exec_kill_command(arguments: &str) -> String {
+fn exec_kill_command(arguments: &str, owner: Option<&str>) -> String {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
         Err(err) => return err,
     };
 
     let mut map = lock_tasks();
-    let Some(task) = map.get_mut(&task_id) else {
+    let Some(task) = map
+        .get_mut(&task_id)
+        .filter(|task| task.owner.as_deref() == owner)
+    else {
         return unknown_task(task_id);
     };
 
@@ -2746,6 +2889,12 @@ mod tests {
         assert!(result.contains("[x] Read code"), "{result}");
         assert!(result.contains("[~] Make change"), "{result}");
         assert!(result.contains("[ ] Run tests"), "{result}");
+    }
+
+    #[test]
+    fn test_write_todos_accepts_an_empty_list_to_clear() {
+        let result = exec_write_todos(r#"{"todos":[]}"#);
+        assert_eq!(result, "Task list cleared.");
     }
 
     #[test]
@@ -3109,7 +3258,7 @@ mod tests {
 
     #[test]
     fn test_run_command_missing_command() {
-        let result = exec_run_command("{}");
+        let result = exec_run_command("{}", None);
         assert!(
             result.contains("missing required parameter"),
             "got: {result}"
@@ -3118,7 +3267,7 @@ mod tests {
 
     #[test]
     fn test_run_command_success() {
-        let result = exec_run_command(r#"{"command": "echo hello"}"#);
+        let result = exec_run_command(r#"{"command": "echo hello"}"#, None);
         assert!(result.contains("hello"), "got: {result}");
         assert!(result.contains("Exit code 0"), "got: {result}");
     }
@@ -3173,7 +3322,7 @@ mod tests {
         let args = json!({"command": command, "cwd": dir.to_str().unwrap()}).to_string();
 
         let started = std::time::Instant::now();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
@@ -3198,7 +3347,7 @@ mod tests {
         let args = json!({"command": "cat", "cwd": dir.to_str().unwrap()}).to_string();
 
         let started = std::time::Instant::now();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
@@ -3206,6 +3355,126 @@ mod tests {
             started.elapsed()
         );
         assert!(result.contains("no output"), "unexpected result: {result}");
+    }
+
+    #[test]
+    fn strip_trailing_comment_block_only_drops_trailing_comment_paragraphs() {
+        assert_eq!(
+            strip_trailing_comment_block("Merge branch 'side'\n\n# Conflicts:\n#\tfile.txt\n"),
+            "Merge branch 'side'"
+        );
+        assert_eq!(
+            strip_trailing_comment_block(
+                "Merge\n\nCo-Authored-By: siGit Code <noreply@sigit.si>\n\n# Conflicts:\n#\tf"
+            ),
+            "Merge\n\nCo-Authored-By: siGit Code <noreply@sigit.si>"
+        );
+        // A heading inside the body, or a paragraph that only starts with
+        // one, is the author's text.
+        let body = "Title\n\n## Why\n\nBecause\n\n# Note\nnot a comment";
+        assert_eq!(strip_trailing_comment_block(body), body);
+        assert_eq!(strip_trailing_comment_block("# only"), "# only");
+        // Extra blank lines, whitespace-only lines, and CRLF still separate
+        // paragraphs.
+        assert_eq!(
+            strip_trailing_comment_block("Merge\n\n\n\n# Conflicts:\n#\tf\n"),
+            "Merge"
+        );
+        assert_eq!(
+            strip_trailing_comment_block("Merge\n \t\n# Conflicts:\n#\tf"),
+            "Merge"
+        );
+        assert_eq!(
+            strip_trailing_comment_block("Merge\r\n\r\n# Conflicts:\r\n#\tf\r\n"),
+            "Merge"
+        );
+        let crlf = "Title\r\n\r\n# Note\r\nnot a comment\r\n";
+        assert_eq!(strip_trailing_comment_block(crlf), crlf.trim_end());
+    }
+
+    /// Start a merge of `side` into `main` that conflicts on file.txt and
+    /// resolve it, leaving the merge ready to commit.
+    fn stage_resolved_merge_conflict(dir: &Path) {
+        test_git(dir, &["switch", "-q", "-c", "side"]);
+        fs::write(dir.join("file.txt"), "side\n").unwrap();
+        test_git(dir, &["commit", "-q", "-am", "Side"]);
+        test_git(dir, &["switch", "-q", "main"]);
+        fs::write(dir.join("file.txt"), "main\n").unwrap();
+        test_git(dir, &["commit", "-q", "-am", "Main"]);
+        let merge = Command::new("git")
+            .args(["merge", "-q", "side"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge should conflict");
+        fs::write(dir.join("file.txt"), "both\n").unwrap();
+        test_git(dir, &["add", "file.txt"]);
+    }
+
+    /// Issue #74's screenshot: the model finished a conflicted merge with
+    /// `git commit --no-edit`, git kept its `# Conflicts:` block, and the
+    /// amended trailer landed above it where GitHub doesn't look.
+    #[test]
+    fn run_command_puts_trailer_last_on_a_conflicted_merge() {
+        let dir = init_test_repo("coauthor_merge_conflict");
+        stage_resolved_merge_conflict(&dir);
+        let args = serde_json::json!({
+            "command": "git commit --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(result.contains("co-author trailer"), "got: {result}");
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message,
+            format!("Merge branch 'side'\n\n{}", commit_co_author_trailer())
+        );
+        let parents = git_stdout(&dir, &["log", "-1", "--format=%P"]).unwrap();
+        assert_eq!(parents.split(' ').count(), 2, "still a merge: {parents}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_drops_comment_block_below_an_existing_trailer() {
+        let dir = init_test_repo("coauthor_merge_trailer_hidden");
+        stage_resolved_merge_conflict(&dir);
+        // The layout from the issue, trailer present but not last. Written
+        // with direct git args because cmd /C can't pass the trailer through.
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "--cleanup=verbatim",
+                "-m",
+                &format!(
+                    "Merge branch 'side'\n\n{}\n\n# Conflicts:\n#\tfile.txt",
+                    commit_co_author_trailer()
+                ),
+            ],
+        );
+        // Change the tree too, or an amend in the same second can reproduce
+        // the same commit id and HEAD wouldn't move.
+        fs::write(dir.join("file.txt"), "both, fixed\n").unwrap();
+        test_git(&dir, &["add", "file.txt"]);
+        let args = serde_json::json!({
+            "command": "git commit --amend --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(result.contains("leftover comment lines"), "got: {result}");
+
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message,
+            format!("Merge branch 'side'\n\n{}", commit_co_author_trailer())
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3220,16 +3489,17 @@ mod tests {
         })
         .to_string();
 
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("co-author trailer"), "got: {result}");
 
         let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        let trailer = commit_co_author_trailer();
         assert!(
-            message.ends_with(COMMIT_CO_AUTHOR_TRAILER),
+            message.ends_with(&trailer),
             "trailer must be the last line: {message:?}"
         );
         assert!(
-            message.contains(&format!("\n\n{COMMIT_CO_AUTHOR_TRAILER}")),
+            message.contains(&format!("\n\n{trailer}")),
             "trailer needs a blank line before it for GitHub to detect it: {message:?}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3251,7 +3521,7 @@ mod tests {
                 "commit",
                 "-q",
                 "-m",
-                &format!("Update file\n\n{COMMIT_CO_AUTHOR_TRAILER}"),
+                &format!("Update file\n\n{}", commit_co_author_trailer()),
             ],
         );
         let args = serde_json::json!({
@@ -3260,7 +3530,7 @@ mod tests {
         })
         .to_string();
 
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(
             !result.contains("[siGit Code]"),
             "no amend expected: {result}"
@@ -3294,7 +3564,7 @@ mod tests {
         })
         .to_string();
 
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(
             !result.contains("[siGit Code]"),
             "no amend expected: {result}"
@@ -3311,6 +3581,66 @@ mod tests {
     }
 
     #[test]
+    fn co_author_trailer_names_the_harness_version_and_surface() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            co_author_trailer_for(Some(Surface::Acp)),
+            format!("Co-Authored-By: siGit Code v{version}-acp <noreply@sigit.si>")
+        );
+        assert_eq!(
+            co_author_trailer_for(Some(Surface::Tui)),
+            format!("Co-Authored-By: siGit Code v{version}-tui <noreply@sigit.si>")
+        );
+        assert_eq!(
+            co_author_trailer_for(Some(Surface::Headless)),
+            format!("Co-Authored-By: siGit Code v{version}-headless <noreply@sigit.si>")
+        );
+        // Before `main` picks a surface (tests, or a tool run outside a
+        // session) the version stands alone rather than guessing.
+        assert_eq!(
+            co_author_trailer_for(None),
+            format!("Co-Authored-By: siGit Code v{version} <noreply@sigit.si>")
+        );
+    }
+
+    #[test]
+    fn run_command_keeps_a_trailer_from_an_older_version() {
+        let dir = init_test_repo("coauthor_older");
+        fs::write(dir.join("file.txt"), "two\n").unwrap();
+        // Same cmd /C constraint as above: the trailer goes in with direct git
+        // args. Commits made before the version was added, or by another
+        // release, already credit siGit Code and must not get a second line.
+        test_git(&dir, &["add", "file.txt"]);
+        test_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update file\n\nCo-Authored-By: siGit Code <noreply@sigit.si>",
+            ],
+        );
+        let args = serde_json::json!({
+            "command": "git commit --amend --no-edit",
+            "cwd": dir.display().to_string(),
+        })
+        .to_string();
+
+        let result = exec_run_command(&args, None);
+        assert!(
+            !result.contains("[siGit Code]"),
+            "no amend expected: {result}"
+        );
+        let message = git_stdout(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert_eq!(
+            message.matches("Co-Authored-By: siGit Code").count(),
+            1,
+            "trailer must not be duplicated: {message:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_run_command_failure() {
         #[cfg(unix)]
         let command = "false";
@@ -3318,7 +3648,7 @@ mod tests {
         let command = "exit /b 1";
 
         let args = serde_json::json!({ "command": command }).to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("failed"), "got: {result}");
     }
 
@@ -3338,7 +3668,7 @@ mod tests {
             "cwd": dir
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         // The output should contain the temp dir path.
         assert!(
             result.contains(&dir.to_string_lossy().to_string()),
@@ -3358,7 +3688,7 @@ mod tests {
             "cwd": missing_dir
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("does not exist"), "got: {result}");
     }
 
@@ -3370,7 +3700,7 @@ mod tests {
         let command = "echo err 1>&2";
 
         let args = serde_json::json!({ "command": command }).to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         assert!(result.contains("err"), "got: {result}");
     }
 
@@ -3422,7 +3752,7 @@ mod tests {
         })
         .to_string();
         let spawned = std::time::Instant::now();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         // Spawning must return immediately, not wait the ~2s the command takes.
         assert!(
             spawned.elapsed() < std::time::Duration::from_secs(1),
@@ -3434,14 +3764,14 @@ mod tests {
 
         // Polling while the command is still sleeping reports it as running.
         let poll_args = serde_json::json!({ "task_id": task_id }).to_string();
-        let poll = exec_command_output(&poll_args);
+        let poll = exec_command_output(&poll_args, None);
         assert!(poll.contains("still running"), "got: {poll}");
         let mut combined = poll;
 
         wait_for_background_exit(task_id);
         // Grace period so the reader threads finish draining the pipes.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let final_poll = exec_command_output(&poll_args);
+        let final_poll = exec_command_output(&poll_args, None);
         assert!(
             final_poll.contains("exited with code 0"),
             "got: {final_poll}"
@@ -3466,12 +3796,12 @@ mod tests {
             "run_in_background": true
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         let task_id = background_task_id(&result);
 
         let kill_args = serde_json::json!({ "task_id": task_id }).to_string();
         let killed_at = std::time::Instant::now();
-        let kill_result = exec_kill_command(&kill_args);
+        let kill_result = exec_kill_command(&kill_args, None);
         assert!(
             kill_result.contains(&format!("Killed task {task_id}")),
             "got: {kill_result}"
@@ -3484,13 +3814,42 @@ mod tests {
         );
 
         // A later poll reports the task as killed, not still running.
-        let poll = exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string());
+        let poll =
+            exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string(), None);
         assert!(poll.contains("was killed"), "got: {poll}");
     }
 
     #[test]
+    fn background_tasks_are_only_visible_to_the_session_that_started_them() {
+        #[cfg(unix)]
+        let command = "sleep 30";
+        #[cfg(windows)]
+        let command = "ping -n 31 127.0.0.1 > nul";
+
+        let result = start_background_task(command, &std::env::temp_dir(), Some("thread-a".into()));
+        let task_id = background_task_id(&result);
+        let args = serde_json::json!({ "task_id": task_id }).to_string();
+
+        // Another thread (or no thread at all) can't see it, let alone kill it.
+        for other in [Some("thread-b"), None] {
+            let poll = exec_command_output(&args, other);
+            assert!(poll.contains("no background task with id"), "got: {poll}");
+            let kill = exec_kill_command(&args, other);
+            assert!(kill.contains("no background task with id"), "got: {kill}");
+        }
+
+        let poll = exec_command_output(&args, Some("thread-a"));
+        assert!(poll.contains("still running"), "got: {poll}");
+        let kill = exec_kill_command(&args, Some("thread-a"));
+        assert!(
+            kill.contains(&format!("Killed task {task_id}")),
+            "got: {kill}"
+        );
+    }
+
+    #[test]
     fn test_command_output_unknown_task() {
-        let result = exec_command_output(r#"{"task_id": 9999999}"#);
+        let result = exec_command_output(r#"{"task_id": 9999999}"#, None);
         assert!(
             result.contains("no background task with id"),
             "got: {result}"
@@ -3558,7 +3917,7 @@ mod tests {
 
     #[test]
     fn test_kill_command_unknown_task() {
-        let result = exec_kill_command(r#"{"task_id": 9999999}"#);
+        let result = exec_kill_command(r#"{"task_id": 9999999}"#, None);
         assert!(
             result.contains("no background task with id"),
             "got: {result}"
@@ -3619,7 +3978,7 @@ mod tests {
 
     #[test]
     fn test_command_output_missing_task_id() {
-        let result = exec_command_output("{}");
+        let result = exec_command_output("{}", None);
         assert!(
             result.contains("missing required parameter"),
             "got: {result}"
@@ -3653,14 +4012,15 @@ mod tests {
             "run_in_background": true
         })
         .to_string();
-        let result = exec_run_command(&args);
+        let result = exec_run_command(&args, None);
         let task_id = background_task_id(&result);
 
         wait_for_background_exit(task_id);
         // Grace period so the reader threads finish draining the pipes.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let poll = exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string());
+        let poll =
+            exec_command_output(&serde_json::json!({ "task_id": task_id }).to_string(), None);
         assert!(poll.contains("exited with code 0"), "got: {poll}");
         assert!(
             poll.contains("earlier output was dropped"),

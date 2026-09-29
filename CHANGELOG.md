@@ -1,5 +1,109 @@
 # Changelog
 
+## Unreleased
+
+## 1.5.11
+
+### Added
+
+- **`sigit run` drives the agent headlessly with resumable sessions.** A new
+  non-interactive subcommand runs a prompt through the same agent loop as the
+  editor and terminal surfaces, for scripts, CI, and Factory clients. Every run
+  gets a UUID session id, writes a JSON-lines history file under
+  `~/.config/sigit/sessions/`, and can be restored with `--resume <id>`.
+  `--output jsonl` emits a structured session/delta/tool/result stream on
+  stdout while logs stay on stderr, and `--allow-tool` pre-approves a tool so
+  permission prompts collapse to denial in a non-interactive context. The
+  legacy `-p` form still works. Each run also rewrites the session metadata
+  with its own cwd and extra roots, so resuming keeps multi-root projects
+
+- **Saved threads can be imported into the editor.** siGit Code now advertises
+  ACP's `sessionCapabilities.list` and answers `session/list`, so Zed's "Import
+  Threads" picker offers the conversations stored under
+  `~/.config/sigit/sessions/` instead of reporting that the agent doesn't
+  support the capability. A saved session gets a sidecar recording the project
+  directory it ran in — listing reports that `cwd`, the extra roots of a
+  multi-root project, an ISO 8601 last-activity timestamp, and a title taken
+  from the first user message — and a request may filter on `cwd` so one
+  project is never offered another's threads. Threads saved before this have no
+  sidecar and are not listed; they still reopen by id through `session/load`
+
+### Changed
+
+- **The commit trailer names the siGit Code version and surface.** Commits
+  siGit Code makes now end with
+  `Co-Authored-By: siGit Code v<version>-<surface> <noreply@sigit.si>` instead
+  of the bare name, where the surface is `acp` (an editor), `tui` (the
+  terminal UI), or `headless` (`sigit run`). The model changes from session to
+  session; the version and surface tell you which build of the agent wrote the
+  commit and how it was driven. GitHub still credits the co-author, since it
+  matches on the address. A commit that already carries a siGit Code trailer
+  from an older version is left alone
+
+- **The terminal UI's model knows which directory the project is in.** The
+  editor (ACP) and headless paths put the working directory in the system
+  prompt, but the terminal UI only added the project's instruction files, so
+  on `/init` a small on-device model invented a `AGENTS.md` path and failed.
+  All three places the terminal UI builds a prompt now go through the same
+  session context path the ACP sessions get. The cloud tier switch had also
+  been dropping the instruction files; that's fixed too
+
+- **An empty `write_todos` list clears the plan.** `write_todos` rejected an
+  empty list, so the model had no way to clear a finished checklist and the
+  last plan stayed in the editor until the session ended. An empty list now
+  returns "Task list cleared." and goes to the client as an ACP plan with no
+  entries. The tool description tells the model it can do this
+
+- **`sigit run` gives clearer usage errors.** A second positional prompt says
+  "unexpected extra argument", a bare `sigit run` says "missing prompt", and a
+  mistyped flag like `--quite` is rejected instead of becoming the prompt
+
+### Fixed
+
+- **Each ACP session keeps its own roots, conversation, and tasks.** Zed runs
+  one siGit process for every open thread, but the process had a single cwd,
+  workspace root list, backend conversation, and background task table. The
+  most recent session owned all of them, so a prompt from an older thread ran
+  against another repo with another thread's history. A `SessionState` is now
+  kept per session id; before a prompt or config change runs, the live
+  conversation is parked and the requested session's cwd, extra roots, and
+  conversation are installed, rebuilding the system prompt from its roots.
+  `new`/`load`/`fork` share a single session-opening path, and fork carries the
+  source thread's conversation. Background tasks are scoped to the session that
+  started them, opening a session no longer wipes every other session's
+  permission grants, and model selection is routed per session
+
+- **New sessions no longer carry the previous thread's history.** Opening a
+  new thread in Zed showed a `[Conversation summary]` from an earlier session.
+  The session handlers cleared the on-device engine but not the history a cloud
+  backend keeps for itself, and the startup routing to the cloud tier then
+  carried that history into the installed backend. A provider override had the
+  same leak. All session entry points now share a path that strips stale
+  history too, and unknown session ids are rejected instead of borrowing the
+  live thread's state
+
+- **Unparseable tool-call markup is hidden and retried, not shown as text.**
+  Some models write tool calls into the reply as text. Well-formed blocks were
+  already recovered and run, but a block that failed to parse or never closed
+  was printed to the editor as-is and stayed in history, so the model later
+  read back a call it had "made" with no result and began writing invented
+  `<function_results>`. The scanner now reports those blocks as malformed; the
+  backend drops them from the reply and history, and when the only tool call
+  was malformed the model gets one retry telling it the call didn't run. A
+  block that merely *mentions* a tool-call marker (a backticked `<tool_call>` or an
+  unclosed XTML `<|open|>tools`) is now kept as prose, so a reply explaining
+  the scanner no longer loses everything after the first marker. The
+  non-streamed path now strips broken blocks beside structured calls and runs
+  any inline calls that did parse, matching the streaming path
+
+- **The co-author trailer ends a conflicted merge commit.** Finishing a
+  conflicted merge with `git commit --no-edit` keeps git's `# Conflicts:` list
+  in the message, since no editor runs to strip it. When siGit Code then added
+  its trailer, the trailer went in above that list, so it was no longer the last
+  paragraph and GitHub didn't credit the co-author. The amend now drops the
+  leftover comment block and puts the trailer last. It also fixes a commit
+  that already has the trailer but still ends in that block
+
 ## 1.5.10
 
 ### What changed

@@ -111,9 +111,13 @@ The agent loop is backend-agnostic. The flow: a turn (messages + tool specs) goe
 feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete backend.
 
 - **`src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
-  new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`
-  (note: it bakes in smbCloud-specific context the agent should use when the repo is clearly
-  smbCloud, and stay general otherwise).
+  new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`.
+  ACP session state owns its roots, conversation, and selected model even though the process has
+  one live backend; activating a thread parks and restores all three. Unknown session ids are
+  rejected instead of silently borrowing the active thread's cwd. Prompt cancellation is routed
+  outside `turn_lock`, which lets a client cancel the turn currently holding that lock. The
+  `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
+  smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
   `ToolResult`, `TurnResult`). Two impls: `LocalBackend` (on-device via `onde::ChatEngine`) and
   `OpenAiBackend` (any OpenAI-compatible HTTP endpoint). A `BackendError` is user-facing: the
@@ -123,6 +127,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
   the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
   explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
+  Some models write tool calls into content as text; `src/inline_tool_calls.rs` recovers the
+  well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
+  and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
+  didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
@@ -131,7 +139,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `multi_edit`, `delete_file`, `run_command`, `write_todos`, `remember`. Add a tool in both the
   spec list (`all_tools`) and the execute `match` (`execute_tool`). `run_command` also enforces
   commit attribution: when a command creates a new commit that lacks the
-  `Co-Authored-By: siGit Code` trailer (`COMMIT_CO_AUTHOR_TRAILER`), it amends the trailer in —
+  `Co-Authored-By: siGit Code` trailer (`commit_co_author_trailer()`, which reads
+  `siGit Code v<version>-<acp|tui|headless>` from the surface `main` sets via `set_surface`), it amends the trailer in —
   unless the commit already exists on a remote, which is never rewritten. Every child process it
   spawns (`spawn_shell`, the `git` helpers, and `hooks.rs`) sets `stdin` to null and never
   inherits it: in ACP mode sigit's stdin is the JSON-RPC pipe from the editor, so a command that
@@ -243,12 +252,32 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `handle_initialize` is what makes the rest of this reachable — without it Zed keeps the first
   root, drops the others, and shows "This agent doesn't currently support multi-root workspaces".
   The process still has one working directory, so the extra roots live in a
-  process-global here and `project_dirs()` returns cwd-first, extras after. Project-local
+  process-global here and `project_dirs()` returns cwd-first, extras after.
+  One process also serves every thread the editor has open, so that global
+  (with the cwd, the backend conversation, and the background-task owner in
+  `tools.rs`) always belongs to the *live* session: `main.rs` keeps a
+  `SessionState` per session id and `activate_session` parks the live one and
+  installs the requested one before any prompt or config change runs. Don't
+  read another session's roots from the global. Project-local
   discovery reads it: skills, slash commands, subagent types, and instruction files all scan
   every root. MCP is deliberately not on that list — `mcp::init` runs once at startup, before
   any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
+- **`src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
+  clients. The legacy `-p` form reaches the same parser. Every new run gets a UUID session id;
+  `--resume <id>` restores that session through `session_store`, and `--output jsonl` emits a
+  structured session/delta/tool/result stream while logs stay on stderr. Headless permission
+  prompts collapse to denial unless the tool was pre-approved with `--allow-tool`.
+- **`src/session_store.rs`** — durable conversations: one JSON-lines history file per session at
+  `$SIGIT_CONFIG_DIR/sessions/<id>.jsonl`, written atomically, restorable into either backend.
+  Each save also writes a `<id>.meta.json` sidecar naming the session's `cwd` and the extra roots
+  of a multi-root project. That sidecar is what makes a thread *listable*: ACP's `session/list`
+  (advertised as `sessionCapabilities.list`, handled by `handle_list_sessions` in `main.rs` — the
+  editor's "Import Threads" picker) must report an absolute `cwd` per session and may filter on
+  it, so a session without one is skipped there while still reopening by id through
+  `session/load`. Sidecars are written at save time, not at session start, so a thread nobody
+  spoke in leaves nothing behind.
 - **`src/setup.rs`** — model cache location, local model discovery, selected-model persistence.
   Must run (`setup_shared_model_cache`) *before* anything touches `ChatEngine`/`hf-hub`, since
   those read env vars once at init.

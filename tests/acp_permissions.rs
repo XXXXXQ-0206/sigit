@@ -943,6 +943,96 @@ fn a_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A tool-call block that can't be parsed must not reach the editor, and must
+/// not stay in history where the model reads it back as a call it made and
+/// starts inventing results (getsigit/sigit#97, #105). The model gets one
+/// retry with a note that the call didn't run.
+#[test]
+fn an_unparseable_tool_call_is_hidden_and_retried() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_body(&[
+            json!({"choices": [{"delta": {"content": "Checking. <tool_call>command_output\n\n<invokeID>reply_A"}}]}),
+            json!({"choices": [{"delta": {"content": "</invokeID>\n<parameter>6</parameter>\n</invoke>\n<function_results>all green"}}]}),
+        ]),
+        sse_tool_call(
+            "call_1",
+            "command_output",
+            &json!({"task_id": 6}).to_string(),
+        ),
+        sse_text("All done."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_malformed_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "is the build done?"}],
+        }),
+    );
+    let (response, rendered) = agent.wait_for_prompt(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    for markup in [
+        "<tool_call>",
+        "<invokeID>",
+        "<function_results>",
+        "all green",
+    ] {
+        assert!(
+            !rendered.contains(markup),
+            "{markup} reached the client: {rendered:?}"
+        );
+    }
+    assert!(rendered.contains("Checking."), "{rendered:?}");
+    assert!(rendered.contains("All done."), "{rendered:?}");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected the retry, then the round answering the retried call"
+    );
+    let retry_messages = requests[1]["messages"].as_array().expect("messages");
+    let last = retry_messages.last().expect("retry note");
+    assert_eq!(last["role"], "user");
+    assert!(
+        last["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("[siGit Code]")),
+        "{last:?}"
+    );
+    for message in requests[2]["messages"].as_array().expect("messages") {
+        let content = message["content"].as_str().unwrap_or_default();
+        assert!(
+            !content.contains("<tool_call>") && !content.contains("<invokeID>"),
+            "broken markup was kept in history: {message:?}"
+        );
+    }
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// Once the repetition guard removes tools from a request, a model may still
 /// emit its learned tool syntax. Known calls must be removed from the visible
 /// response without being executed or recorded as orphaned history entries.
@@ -1199,6 +1289,63 @@ fn write_todos_reaches_the_client_as_an_acp_plan() {
             update["sessionUpdate"] == "tool_call" && update["title"] == "write_todos"
         }),
         "write_todos must not show up as a generic tool-call card: {updates:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// An empty `write_todos` is how the model clears a finished checklist. It has
+/// to reach the client as a plan with no entries, since ACP plan updates
+/// replace the whole plan, rather than as an error card that leaves the old
+/// list on screen.
+#[test]
+fn an_empty_write_todos_clears_the_acp_plan() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "write_todos", &json!({"todos": []}).to_string()),
+        sse_text("Checklist cleared."),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_plan_clear_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "clear the checklist"}],
+        }),
+    );
+    let (response, updates) = agent.wait_for_response_with_updates(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let plan = updates
+        .iter()
+        .find(|update| update["sessionUpdate"] == "plan")
+        .expect("an empty write_todos should still send a plan update");
+    assert_eq!(plan["entries"], json!([]));
+    assert!(
+        !updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call"),
+        "clearing the plan must not show a tool-call card: {updates:?}"
     );
 
     drop(agent);
