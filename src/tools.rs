@@ -2042,16 +2042,25 @@ fn git_head(cwd: &Path) -> Option<String> {
 /// `# Conflicts:` list stays in the commit. Any trailer after it is no longer
 /// in the last paragraph, and GitHub stops seeing it. Only trailing
 /// paragraphs made entirely of `#` lines go; a `#` line inside the message
-/// (a Markdown heading in a `-m` body, say) is left alone.
+/// (a Markdown heading in a `-m` body, say) is left alone. Paragraphs are
+/// split on any blank line, so a run of them or CRLF endings work too.
 fn strip_trailing_comment_block(message: &str) -> &str {
     let mut rest = message.trim_end();
     loop {
-        let (head, last) = match rest.rfind("\n\n") {
-            Some(split) => (&rest[..split], &rest[split + 2..]),
-            None => return rest,
-        };
-        if last.lines().all(|line| line.starts_with('#')) {
-            rest = head.trim_end();
+        // Byte offset just past the last blank line, i.e. where the final
+        // paragraph starts. `rest` never ends in one, so that paragraph
+        // is non-empty.
+        let mut split = None;
+        let mut offset = 0;
+        for line in rest.split_inclusive('\n') {
+            offset += line.len();
+            if line.trim().is_empty() {
+                split = Some(offset);
+            }
+        }
+        let Some(split) = split else { return rest };
+        if rest[split..].lines().all(|line| line.starts_with('#')) {
+            rest = rest[..split].trim_end();
         } else {
             return rest;
         }
@@ -3315,6 +3324,22 @@ mod tests {
         let body = "Title\n\n## Why\n\nBecause\n\n# Note\nnot a comment";
         assert_eq!(strip_trailing_comment_block(body), body);
         assert_eq!(strip_trailing_comment_block("# only"), "# only");
+        // Extra blank lines, whitespace-only lines, and CRLF still separate
+        // paragraphs.
+        assert_eq!(
+            strip_trailing_comment_block("Merge\n\n\n\n# Conflicts:\n#\tf\n"),
+            "Merge"
+        );
+        assert_eq!(
+            strip_trailing_comment_block("Merge\n \t\n# Conflicts:\n#\tf"),
+            "Merge"
+        );
+        assert_eq!(
+            strip_trailing_comment_block("Merge\r\n\r\n# Conflicts:\r\n#\tf\r\n"),
+            "Merge"
+        );
+        let crlf = "Title\r\n\r\n# Note\r\nnot a comment\r\n";
+        assert_eq!(strip_trailing_comment_block(crlf), crlf.trim_end());
     }
 
     /// Start a merge of `side` into `main` that conflicts on file.txt and
