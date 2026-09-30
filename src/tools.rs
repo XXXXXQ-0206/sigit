@@ -2513,9 +2513,28 @@ fn dropped_note(dropped: bool) -> &'static str {
 
 /// `command_output` tool: output since the last poll + running/exited status.
 fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
+    poll_command_output(arguments, owner).text
+}
+
+/// One `command_output` check, with the tool text and whether anything
+/// changed, so the long-poll loop never has to parse its own wording.
+struct CommandPoll {
+    text: String,
+    /// Still running and nothing new printed since the last check.
+    idle: bool,
+}
+
+impl CommandPoll {
+    /// A result that ends the wait: an error, or a task that isn't ours.
+    fn done(text: String) -> Self {
+        Self { text, idle: false }
+    }
+}
+
+fn poll_command_output(arguments: &str, owner: Option<&str>) -> CommandPoll {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
-        Err(err) => return err,
+        Err(err) => return CommandPoll::done(err),
     };
 
     let mut map = lock_tasks();
@@ -2523,7 +2542,7 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
         .get_mut(&task_id)
         .filter(|task| task.owner.as_deref() == owner)
     else {
-        return unknown_task(task_id);
+        return CommandPoll::done(unknown_task(task_id));
     };
 
     let was_running = task.exit_code.is_none();
@@ -2543,7 +2562,8 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
         Some(code) => format!("Task {task_id} (`{command}`) exited with code {code}."),
     };
 
-    if new_output.is_empty() {
+    let idle = exit_code.is_none() && new_output.is_empty();
+    let text = if new_output.is_empty() {
         format!(
             "{status} No new output since the last check.{}",
             dropped_note(dropped)
@@ -2553,7 +2573,8 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
             "{status} New output since the last check:{}\n{new_output}",
             dropped_note(dropped)
         )
-    }
+    };
+    CommandPoll { text, idle }
 }
 
 /// Long-poll a background task without occupying Tokio's blocking pool while
@@ -2575,17 +2596,15 @@ async fn exec_command_output_wait(arguments: &str) -> String {
     loop {
         let arguments = arguments.to_owned();
         let owner = owner.clone();
-        let output =
-            tokio::task::spawn_blocking(move || exec_command_output(&arguments, owner.as_deref()))
+        let poll =
+            tokio::task::spawn_blocking(move || poll_command_output(&arguments, owner.as_deref()))
                 .await
-                .unwrap_or_else(|err| format!("Error: command_output task failed: {err}"));
+                .unwrap_or_else(|err| {
+                    CommandPoll::done(format!("Error: command_output task failed: {err}"))
+                });
 
-        if wait_seconds == 0
-            || !output.contains(" is still running.")
-            || !output.contains(" No new output since the last check.")
-            || tokio::time::Instant::now() >= deadline
-        {
-            return output;
+        if wait_seconds == 0 || !poll.idle || tokio::time::Instant::now() >= deadline {
+            return poll.text;
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -3852,6 +3871,34 @@ mod tests {
 
         assert!(poll.contains("exited with code 0"), "got: {poll}");
         assert!(poll.contains("done"), "got: {poll}");
+    }
+
+    #[tokio::test]
+    async fn test_command_output_waits_out_a_quiet_running_task() {
+        #[cfg(unix)]
+        let command = "sleep 30";
+        #[cfg(windows)]
+        let command = "ping -n 31 127.0.0.1 > nul";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let task_id = background_task_id(&exec_run_command(&args, None));
+
+        let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 1 }).to_string();
+        let started = std::time::Instant::now();
+        let poll = exec_command_output_wait(&poll_args).await;
+
+        assert!(poll.contains("still running"), "got: {poll}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "an idle task should hold the poll for the whole window, returned after {:?}",
+            started.elapsed()
+        );
+        exec_kill_command(&serde_json::json!({ "task_id": task_id }).to_string(), None);
     }
 
     #[test]
