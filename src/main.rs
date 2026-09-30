@@ -2332,7 +2332,11 @@ impl SiGitAgent {
                     .entry(signature)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                let repeated = *repeat_count >= 3;
+                // Repeated status checks are expected for a live background
+                // command. command_output long-polls and the overall round cap
+                // still bounds a confused model without cutting off a real
+                // build or release while it is in progress.
+                let repeated = *repeat_count >= 3 && tc.name != "command_output";
                 if repeated {
                     force_text = true;
                     log::warn!(
