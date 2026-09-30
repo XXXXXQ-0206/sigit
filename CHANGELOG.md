@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The Windows binaries start on machines without the Visual C++
+  Redistributable.** They used to import `VCRUNTIME140.dll` and the UCRT
+  `api-ms-win-crt-*` DLLs, so a clean Windows install refused to load them
+  with `STATUS_DLL_NOT_FOUND` (0xC0000135). That is what failed winget's
+  post-install check. The C runtime is now linked statically, and CI and the
+  release build fail if a Windows exe picks up that dependency again.
+
 ## 1.5.11
 
 ### Added
