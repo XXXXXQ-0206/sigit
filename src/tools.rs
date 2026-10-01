@@ -465,7 +465,7 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
     match name {
         TASK_TOOL_NAME => exec_task(arguments).await,
         WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
-        "command_output" => exec_command_output_wait(arguments).await,
+        "command_output" => exec_command_output_wait(arguments, active_session()).await,
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
         // and forwarded to the owning server.
         _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
@@ -2516,18 +2516,21 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
     poll_command_output(arguments, owner).text
 }
 
-/// One `command_output` check, with the tool text and whether anything
-/// changed, so the long-poll loop never has to parse its own wording.
+/// One `command_output` check, with the tool text and whether the task is
+/// still running, so the long-poll loop knows when to keep waiting.
 struct CommandPoll {
     text: String,
-    /// Still running and nothing new printed since the last check.
-    idle: bool,
+    /// True while the task's child process is still running.
+    running: bool,
 }
 
 impl CommandPoll {
     /// A result that ends the wait: an error, or a task that isn't ours.
     fn done(text: String) -> Self {
-        Self { text, idle: false }
+        Self {
+            text,
+            running: false,
+        }
     }
 }
 
@@ -2562,7 +2565,7 @@ fn poll_command_output(arguments: &str, owner: Option<&str>) -> CommandPoll {
         Some(code) => format!("Task {task_id} (`{command}`) exited with code {code}."),
     };
 
-    let idle = exit_code.is_none() && new_output.is_empty();
+    let running = exit_code.is_none();
     let text = if new_output.is_empty() {
         format!(
             "{status} No new output since the last check.{}",
@@ -2574,13 +2577,13 @@ fn poll_command_output(arguments: &str, owner: Option<&str>) -> CommandPoll {
             dropped_note(dropped)
         )
     };
-    CommandPoll { text, idle }
+    CommandPoll { text, running }
 }
 
 /// Long-poll a background task without occupying Tokio's blocking pool while
 /// nothing changes. This keeps model tool rounds from being consumed by a
 /// tight status-check loop.
-async fn exec_command_output_wait(arguments: &str) -> String {
+async fn exec_command_output_wait(arguments: &str, owner: Option<String>) -> String {
     const DEFAULT_WAIT_SECONDS: u64 = 10;
     const MAX_WAIT_SECONDS: u64 = 30;
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
@@ -2590,7 +2593,6 @@ async fn exec_command_output_wait(arguments: &str) -> String {
         .and_then(|args| args.get("wait_seconds").and_then(Value::as_u64))
         .unwrap_or(DEFAULT_WAIT_SECONDS)
         .min(MAX_WAIT_SECONDS);
-    let owner = active_session();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
 
     loop {
@@ -2603,7 +2605,7 @@ async fn exec_command_output_wait(arguments: &str) -> String {
                     CommandPoll::done(format!("Error: command_output task failed: {err}"))
                 });
 
-        if wait_seconds == 0 || !poll.idle || tokio::time::Instant::now() >= deadline {
+        if wait_seconds == 0 || !poll.running || tokio::time::Instant::now() >= deadline {
             return poll.text;
         }
 
@@ -3867,7 +3869,7 @@ mod tests {
             "wait_seconds": 5
         })
         .to_string();
-        let poll = exec_command_output_wait(&poll_args).await;
+        let poll = exec_command_output_wait(&poll_args, None).await;
 
         assert!(poll.contains("exited with code 0"), "got: {poll}");
         assert!(poll.contains("done"), "got: {poll}");
@@ -3890,7 +3892,7 @@ mod tests {
 
         let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 1 }).to_string();
         let started = std::time::Instant::now();
-        let poll = exec_command_output_wait(&poll_args).await;
+        let poll = exec_command_output_wait(&poll_args, None).await;
 
         assert!(poll.contains("still running"), "got: {poll}");
         assert!(
