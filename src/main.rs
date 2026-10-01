@@ -266,6 +266,21 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> String {
 /// context window, so the cap can afford to be generous
 const MAX_TOOL_ROUNDS: usize = 24;
 
+/// What the user sees when a turn that ran tools ends with no closing text.
+fn silent_stop_message(repeated_tool: Option<&str>, rounds: usize) -> String {
+    match repeated_tool {
+        Some(tool) => format!(
+            "I stopped because I kept making the same `{tool}` call without getting \
+             anywhere, and I had nothing to add without it. Reply \"continue\" to pick \
+             it back up, or tell me what to try instead."
+        ),
+        None => format!(
+            "I stopped after {rounds} tool round(s) without writing a final answer. \
+             Reply \"continue\" to pick it back up, or tell me what to try instead."
+        ),
+    }
+}
+
 /// Separator between two stretches of assistant prose that a tool round split
 /// apart. ACP clients concatenate consecutive agent-message chunks into a
 /// single block, so a plain newline (or nothing at all) leaves the rounds
@@ -2231,6 +2246,11 @@ impl SiGitAgent {
         };
 
         let mut round = 0;
+        // Set when the repetition guard blocked a call; names the tool.
+        let mut stopped_repeating: Option<String> = None;
+        // Visible text already sent before the latest inference round, so the
+        // end of the turn can tell whether that round said anything at all.
+        let mut sent_before_last_round = 0;
 
         while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
             if cancellation.cancelled.load(Ordering::Acquire) {
@@ -2332,9 +2352,14 @@ impl SiGitAgent {
                     .entry(signature)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
-                let repeated = *repeat_count >= 3;
+                // Repeated status checks are expected for a live background
+                // command. command_output long-polls and the overall round cap
+                // still bounds a confused model without cutting off a real
+                // build or release while it is in progress.
+                let repeated = *repeat_count >= 3 && tc.name != "command_output";
                 if repeated {
                     force_text = true;
+                    stopped_repeating = Some(tc.name.clone());
                     log::warn!(
                         "prompt({}) stopping repeated tool call `{}` after {} attempts",
                         session_id,
@@ -2468,6 +2493,7 @@ impl SiGitAgent {
             // Whatever this round says starts a new paragraph rather than
             // continuing the sentence the tool calls interrupted.
             reply.interrupt();
+            sent_before_last_round = reply.sent.len();
 
             let cancelled_results = tool_results.clone();
             result = match self
@@ -2510,7 +2536,7 @@ impl SiGitAgent {
                         session_id,
                         round
                     );
-                    "Something went wrong — the edits didn't go through. Try rephrasing what you need, or point me at the specific lines.".to_string()
+                    silent_stop_message(stopped_repeating.as_deref(), round)
                 } else {
                     log::warn!(
                         "prompt({}) — model returned empty reply (no tool rounds)",
@@ -2528,6 +2554,25 @@ impl SiGitAgent {
                 self.send_assistant_message(cx, session_id.clone(), final_text)
                     .ok();
             }
+        } else if round > 0 && reply.sent.len() == sent_before_last_round {
+            // Earlier rounds streamed text, but the last one (typically the
+            // forced no-tools round) said nothing. Without a closing message
+            // the turn just stops, and the user can't tell whether it ended,
+            // stalled, or is waiting on them.
+            log::warn!(
+                "prompt({}) — final round after {} tool round(s) produced no text",
+                session_id,
+                round
+            );
+            self.send_assistant_message(
+                cx,
+                session_id.clone(),
+                format!(
+                    "{PARAGRAPH_BREAK}{}",
+                    silent_stop_message(stopped_repeating.as_deref(), round)
+                ),
+            )
+            .ok();
         }
 
         // Persist the completed turn so a restart (or session/load) can pick
