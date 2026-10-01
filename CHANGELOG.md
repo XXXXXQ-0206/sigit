@@ -15,9 +15,9 @@
   Polling `command_output` on the same task id three times tripped the
   repeated-tool-call guard, which refused the call and dropped tools for the
   rest of the turn. `command_output` now long-polls — it waits up to
-  `wait_seconds` (default 10, max 30) for new output or an exit before
-  returning — and the repeat guard exempts it, since polling the same task is
-  the whole point of the tool.
+  `wait_seconds` (default 10, max 30) for the task to exit, then returns
+  everything printed in the meantime — and the repeat guard exempts it, since
+  polling the same task is the whole point of the tool.
 
 - **A turn that ends with no visible text says why.** When the
   repeated-tool-call guard blocked a call and the forced no-tools round came

@@ -2513,7 +2513,7 @@ fn dropped_note(dropped: bool) -> &'static str {
 
 /// `command_output` tool: output since the last poll + running/exited status.
 fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
-    poll_command_output(arguments, owner).text
+    poll_command_output(arguments, owner, false).text
 }
 
 /// One `command_output` check, with the tool text and whether the task is
@@ -2534,7 +2534,14 @@ impl CommandPoll {
     }
 }
 
-fn poll_command_output(arguments: &str, owner: Option<&str>) -> CommandPoll {
+/// `hold_while_running` is the long-poll's "not my last look" flag: a task
+/// that is still running keeps its output buffered and the returned text is
+/// empty, so the call that finally reports is the one that drains it.
+fn poll_command_output(
+    arguments: &str,
+    owner: Option<&str>,
+    hold_while_running: bool,
+) -> CommandPoll {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
         Err(err) => return CommandPoll::done(err),
@@ -2550,6 +2557,12 @@ fn poll_command_output(arguments: &str, owner: Option<&str>) -> CommandPoll {
 
     let was_running = task.exit_code.is_none();
     let exit_code = poll_exit_code(task);
+    if hold_while_running && exit_code.is_none() {
+        return CommandPoll {
+            text: String::new(),
+            running: true,
+        };
+    }
     if was_running && exit_code.is_some() {
         // The child just exited; give the reader threads a moment to flush
         // the final output through the pipes before draining the buffer.
@@ -2598,14 +2611,18 @@ async fn exec_command_output_wait(arguments: &str, owner: Option<String>) -> Str
     loop {
         let arguments = arguments.to_owned();
         let owner = owner.clone();
-        let poll =
-            tokio::task::spawn_blocking(move || poll_command_output(&arguments, owner.as_deref()))
-                .await
-                .unwrap_or_else(|err| {
-                    CommandPoll::done(format!("Error: command_output task failed: {err}"))
-                });
+        // Every poll drains the task's buffer, so only the last look may take
+        // the output of a running task; an earlier one would throw it away.
+        let last_look = wait_seconds == 0 || tokio::time::Instant::now() >= deadline;
+        let poll = tokio::task::spawn_blocking(move || {
+            poll_command_output(&arguments, owner.as_deref(), !last_look)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            CommandPoll::done(format!("Error: command_output task failed: {err}"))
+        });
 
-        if wait_seconds == 0 || !poll.running || tokio::time::Instant::now() >= deadline {
+        if last_look || !poll.running {
             return poll.text;
         }
 
@@ -3791,6 +3808,14 @@ mod tests {
         }
     }
 
+    /// The output part of a `command_output` reply. The status line quotes
+    /// the command, so matching the whole reply finds "echo done" whether or
+    /// not `done` was ever printed.
+    fn polled_output(poll: &str) -> &str {
+        poll.split_once("New output since the last check:")
+            .map_or("", |(_, output)| output)
+    }
+
     /// Wait (bounded) for a background task's child to exit.
     fn wait_for_background_exit(task_id: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -3872,7 +3897,55 @@ mod tests {
         let poll = exec_command_output_wait(&poll_args, None).await;
 
         assert!(poll.contains("exited with code 0"), "got: {poll}");
-        assert!(poll.contains("done"), "got: {poll}");
+        assert!(polled_output(&poll).contains("done"), "got: {poll}");
+    }
+
+    #[tokio::test]
+    async fn test_command_output_wait_keeps_output_printed_before_exit() {
+        #[cfg(unix)]
+        let command = "echo start; sleep 1; echo done";
+        #[cfg(windows)]
+        let command = "echo start&& ping -n 2 127.0.0.1 > nul&& echo done";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let task_id = background_task_id(&exec_run_command(&args, None));
+
+        let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 5 }).to_string();
+        let poll = exec_command_output_wait(&poll_args, None).await;
+
+        // "start" is printed well before the exit the wait returns on; the
+        // polls in between must not have drained it away.
+        assert!(poll.contains("exited with code 0"), "got: {poll}");
+        assert!(polled_output(&poll).contains("start"), "got: {poll}");
+        assert!(polled_output(&poll).contains("done"), "got: {poll}");
+    }
+
+    #[tokio::test]
+    async fn test_command_output_wait_reports_output_of_a_running_task() {
+        #[cfg(unix)]
+        let command = "echo start; sleep 30";
+        #[cfg(windows)]
+        let command = "echo start&& ping -n 31 127.0.0.1 > nul";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let task_id = background_task_id(&exec_run_command(&args, None));
+
+        let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 1 }).to_string();
+        let poll = exec_command_output_wait(&poll_args, None).await;
+
+        assert!(poll.contains("still running"), "got: {poll}");
+        assert!(polled_output(&poll).contains("start"), "got: {poll}");
+        exec_kill_command(&serde_json::json!({ "task_id": task_id }).to_string(), None);
     }
 
     #[tokio::test]
