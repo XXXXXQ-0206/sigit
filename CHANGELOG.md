@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Three more siGit Code Cloud tiers: `flare`, `zenith` and `prism`.** They
+  show up in `/models` and in the editor's model picker alongside the existing
+  tiers. Selecting one needs a signed-in account, as before.
+
 ## 1.5.12
 
 ### Fixed
