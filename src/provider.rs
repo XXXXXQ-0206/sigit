@@ -40,7 +40,7 @@ const DEFAULT_CLOUD_URL: &str = "https://sigit.si/api/v1";
 /// to be updated together when a tier is added.
 pub const CLOUD_TIERS: &[&str] = &[
     "fast", "balanced", "large", "mini", "air", "pro", "oke", "flux", "apex", "aura", "orbit",
-    "nova",
+    "nova", "flare", "zenith", "prism",
 ];
 
 pub const DEFAULT_CLOUD_TIER: &str = "nova";
@@ -85,6 +85,9 @@ fn tier_to_model(tier: &str) -> String {
         "aura" => "onde-aura",
         "orbit" => "onde-orbit",
         "nova" => "onde-nova",
+        "flare" => "onde-flare",
+        "zenith" => "onde-zenith",
+        "prism" => "onde-prism",
         other => other,
     }
     .to_string()
@@ -266,5 +269,13 @@ mod tests {
     fn maps_default_cloud_tier_to_wire_model_id() {
         assert_eq!(DEFAULT_CLOUD_TIER, "nova");
         assert_eq!(tier_to_model(DEFAULT_CLOUD_TIER), "onde-nova");
+    }
+
+    #[test]
+    fn maps_every_cloud_tier_to_an_onde_model_id() {
+        for tier in CLOUD_TIERS {
+            let model = tier_to_model(tier);
+            assert!(model.starts_with("onde-"), "{tier} maps to {model}");
+        }
     }
 }
