@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const TIMEOUT: Duration = Duration::from_secs(30);
+/// This is the first test file to launch the freshly built binary, and on the
+/// Intel macOS runner that first launch alone has taken 25 seconds.
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 const ALLOWANCE_MESSAGE: &str = "Monthly siGit Code Cloud allowance reached. It resets at the start of your next billing period.";
 
