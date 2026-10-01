@@ -390,9 +390,10 @@ pub fn all_tools() -> Vec<AgentTool> {
             name: "command_output",
             description: "Get the output a background task (started with run_command's \
                            run_in_background) has produced since your last check, plus its \
-                           status: still running, or exited with an exit code. Poll this \
-                           periodically to follow builds, test suites, and servers. Between \
-                           polls output is buffered up to 50 000 bytes per task; older \
+                           status: still running, or exited with an exit code. By default the \
+                           call waits up to 10 seconds for new output or completion, so call it \
+                           again when the task is still running rather than ending the turn. \
+                           Between polls output is buffered up to 50 000 bytes per task; older \
                            output beyond that is dropped and the truncation is noted.",
             parameters_schema: json!({
                 "type": "object",
@@ -400,6 +401,12 @@ pub fn all_tools() -> Vec<AgentTool> {
                     "task_id": {
                         "type": "integer",
                         "description": "Id of the background task, as returned by run_command with run_in_background."
+                    },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30,
+                        "description": "Seconds to wait for new output or task completion before returning. Defaults to 10; use 0 for an immediate status check."
                     }
                 },
                 "required": ["task_id"],
@@ -458,6 +465,7 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
     match name {
         TASK_TOOL_NAME => exec_task(arguments).await,
         WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
+        "command_output" => exec_command_output_wait(arguments, active_session()).await,
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
         // and forwarded to the owning server.
         _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
@@ -515,7 +523,6 @@ fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> String
         "remember" => exec_remember(arguments),
         "delete_file" => exec_delete_file(arguments),
         "run_command" => exec_run_command(arguments, owner),
-        "command_output" => exec_command_output(arguments, owner),
         "kill_command" => exec_kill_command(arguments, owner),
         "skill" => crate::skills::activate_skill(arguments),
         _ => format!("Unknown tool: {name}"),
@@ -2506,9 +2513,38 @@ fn dropped_note(dropped: bool) -> &'static str {
 
 /// `command_output` tool: output since the last poll + running/exited status.
 fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
+    poll_command_output(arguments, owner, false).text
+}
+
+/// One `command_output` check, with the tool text and whether the task is
+/// still running, so the long-poll loop knows when to keep waiting.
+struct CommandPoll {
+    text: String,
+    /// True while the task's child process is still running.
+    running: bool,
+}
+
+impl CommandPoll {
+    /// A result that ends the wait: an error, or a task that isn't ours.
+    fn done(text: String) -> Self {
+        Self {
+            text,
+            running: false,
+        }
+    }
+}
+
+/// `hold_while_running` is the long-poll's "not my last look" flag: a task
+/// that is still running keeps its output buffered and the returned text is
+/// empty, so the call that finally reports is the one that drains it.
+fn poll_command_output(
+    arguments: &str,
+    owner: Option<&str>,
+    hold_while_running: bool,
+) -> CommandPoll {
     let task_id = match parse_task_id(arguments) {
         Ok(id) => id,
-        Err(err) => return err,
+        Err(err) => return CommandPoll::done(err),
     };
 
     let mut map = lock_tasks();
@@ -2516,16 +2552,23 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
         .get_mut(&task_id)
         .filter(|task| task.owner.as_deref() == owner)
     else {
-        return unknown_task(task_id);
+        return CommandPoll::done(unknown_task(task_id));
     };
 
     let was_running = task.exit_code.is_none();
     let exit_code = poll_exit_code(task);
+    if hold_while_running && exit_code.is_none() {
+        return CommandPoll {
+            text: String::new(),
+            running: true,
+        };
+    }
     if was_running && exit_code.is_some() {
         // The child just exited; give the reader threads a moment to flush
         // the final output through the pipes before draining the buffer.
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+
     let (new_output, dropped) = drain_task_output(task);
 
     let command = &task.command;
@@ -2535,7 +2578,8 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
         Some(code) => format!("Task {task_id} (`{command}`) exited with code {code}."),
     };
 
-    if new_output.is_empty() {
+    let running = exit_code.is_none();
+    let text = if new_output.is_empty() {
         format!(
             "{status} No new output since the last check.{}",
             dropped_note(dropped)
@@ -2545,6 +2589,44 @@ fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
             "{status} New output since the last check:{}\n{new_output}",
             dropped_note(dropped)
         )
+    };
+    CommandPoll { text, running }
+}
+
+/// Long-poll a background task without occupying Tokio's blocking pool while
+/// nothing changes. This keeps model tool rounds from being consumed by a
+/// tight status-check loop.
+async fn exec_command_output_wait(arguments: &str, owner: Option<String>) -> String {
+    const DEFAULT_WAIT_SECONDS: u64 = 10;
+    const MAX_WAIT_SECONDS: u64 = 30;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+    let wait_seconds = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|args| args.get("wait_seconds").and_then(Value::as_u64))
+        .unwrap_or(DEFAULT_WAIT_SECONDS)
+        .min(MAX_WAIT_SECONDS);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
+
+    loop {
+        let arguments = arguments.to_owned();
+        let owner = owner.clone();
+        // Every poll drains the task's buffer, so only the last look may take
+        // the output of a running task; an earlier one would throw it away.
+        let last_look = wait_seconds == 0 || tokio::time::Instant::now() >= deadline;
+        let poll = tokio::task::spawn_blocking(move || {
+            poll_command_output(&arguments, owner.as_deref(), !last_look)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            CommandPoll::done(format!("Error: command_output task failed: {err}"))
+        });
+
+        if last_look || !poll.running {
+            return poll.text;
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -3726,6 +3808,14 @@ mod tests {
         }
     }
 
+    /// The output part of a `command_output` reply. The status line quotes
+    /// the command, so matching the whole reply finds "echo done" whether or
+    /// not `done` was ever printed.
+    fn polled_output(poll: &str) -> &str {
+        poll.split_once("New output since the last check:")
+            .map_or("", |(_, output)| output)
+    }
+
     /// Wait (bounded) for a background task's child to exit.
     fn wait_for_background_exit(task_id: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -3781,6 +3871,109 @@ mod tests {
         // Across the polls, all output the command printed was delivered.
         assert!(combined.contains("start"), "got: {combined}");
         assert!(combined.contains("done"), "got: {combined}");
+    }
+
+    #[tokio::test]
+    async fn test_command_output_waits_for_background_completion() {
+        #[cfg(unix)]
+        let command = "sleep 1; echo done";
+        #[cfg(windows)]
+        let command = "ping -n 2 127.0.0.1 > nul&& echo done";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let result = exec_run_command(&args, None);
+        let task_id = background_task_id(&result);
+
+        let poll_args = serde_json::json!({
+            "task_id": task_id,
+            "wait_seconds": 5
+        })
+        .to_string();
+        let poll = exec_command_output_wait(&poll_args, None).await;
+
+        assert!(poll.contains("exited with code 0"), "got: {poll}");
+        assert!(polled_output(&poll).contains("done"), "got: {poll}");
+    }
+
+    #[tokio::test]
+    async fn test_command_output_wait_keeps_output_printed_before_exit() {
+        #[cfg(unix)]
+        let command = "echo start; sleep 1; echo done";
+        #[cfg(windows)]
+        let command = "echo start&& ping -n 2 127.0.0.1 > nul&& echo done";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let task_id = background_task_id(&exec_run_command(&args, None));
+
+        let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 5 }).to_string();
+        let poll = exec_command_output_wait(&poll_args, None).await;
+
+        // "start" is printed well before the exit the wait returns on; the
+        // polls in between must not have drained it away.
+        assert!(poll.contains("exited with code 0"), "got: {poll}");
+        assert!(polled_output(&poll).contains("start"), "got: {poll}");
+        assert!(polled_output(&poll).contains("done"), "got: {poll}");
+    }
+
+    #[tokio::test]
+    async fn test_command_output_wait_reports_output_of_a_running_task() {
+        #[cfg(unix)]
+        let command = "echo start; sleep 30";
+        #[cfg(windows)]
+        let command = "echo start&& ping -n 31 127.0.0.1 > nul";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let task_id = background_task_id(&exec_run_command(&args, None));
+
+        let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 1 }).to_string();
+        let poll = exec_command_output_wait(&poll_args, None).await;
+
+        assert!(poll.contains("still running"), "got: {poll}");
+        assert!(polled_output(&poll).contains("start"), "got: {poll}");
+        exec_kill_command(&serde_json::json!({ "task_id": task_id }).to_string(), None);
+    }
+
+    #[tokio::test]
+    async fn test_command_output_waits_out_a_quiet_running_task() {
+        #[cfg(unix)]
+        let command = "sleep 30";
+        #[cfg(windows)]
+        let command = "ping -n 31 127.0.0.1 > nul";
+
+        let args = serde_json::json!({
+            "command": command,
+            "cwd": std::env::temp_dir(),
+            "run_in_background": true
+        })
+        .to_string();
+        let task_id = background_task_id(&exec_run_command(&args, None));
+
+        let poll_args = serde_json::json!({ "task_id": task_id, "wait_seconds": 1 }).to_string();
+        let started = std::time::Instant::now();
+        let poll = exec_command_output_wait(&poll_args, None).await;
+
+        assert!(poll.contains("still running"), "got: {poll}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "an idle task should hold the poll for the whole window, returned after {:?}",
+            started.elapsed()
+        );
+        exec_kill_command(&serde_json::json!({ "task_id": task_id }).to_string(), None);
     }
 
     #[test]

@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 1.5.12
+
+### Fixed
+
+- **The Windows binaries start on machines without the Visual C++
+  Redistributable.** They used to import `VCRUNTIME140.dll` and the UCRT
+  `api-ms-win-crt-*` DLLs, so a clean Windows install refused to load them
+  with `STATUS_DLL_NOT_FOUND` (0xC0000135). That is what failed winget's
+  post-install check. The C runtime is now linked statically, and CI and the
+  release build fail if a Windows exe picks up that dependency again.
+
+- **Watching a slow background command no longer ends the turn early.**
+  Polling `command_output` on the same task id three times tripped the
+  repeated-tool-call guard, which refused the call and dropped tools for the
+  rest of the turn. `command_output` now long-polls — it waits up to
+  `wait_seconds` (default 10, max 30) for the task to exit, then returns
+  everything printed in the meantime — and the repeat guard exempts it, since
+  polling the same task is the whole point of the tool.
+
+- **A turn that ends with no visible text says why.** When the
+  repeated-tool-call guard blocked a call and the forced no-tools round came
+  back empty, sigit sent nothing more — the turn just stopped with no answer
+  and no question. When the last round of a tool-using turn produces no
+  visible text, sigit now sends a short closing message naming the repeated
+  tool and asking you to reply "continue" or redirect.
 
 ## 1.5.11
 

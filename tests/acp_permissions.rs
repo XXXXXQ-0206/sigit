@@ -1038,11 +1038,11 @@ fn an_unparseable_tool_call_is_hidden_and_retried() {
 /// response without being executed or recorded as orphaned history entries.
 #[test]
 fn forced_text_suppresses_glm_check_status_tool_markup() {
-    let repeated_arguments = json!({"task_id": 1}).to_string();
+    let repeated_arguments = json!({"path": "missing.txt"}).to_string();
     let endpoint = start_fake_endpoint(vec![
-        sse_tool_call("call_1", "command_output", &repeated_arguments),
-        sse_tool_call("call_2", "command_output", &repeated_arguments),
-        sse_tool_call("call_3", "command_output", &repeated_arguments),
+        sse_tool_call("call_1", "read_file", &repeated_arguments),
+        sse_tool_call("call_2", "read_file", &repeated_arguments),
+        sse_tool_call("call_3", "read_file", &repeated_arguments),
         sse_body(&[
             json!({"choices": [{"delta": {"content": "Build is still running. <tool_call>command_output CheckStatus=true_or_poll_"}}]}),
             json!({"choices": [{"delta": {"content": "again_with_different_params</arg_value><arg_key>task_id</arg_key><arg_value>1</arg_value></tool_call>"}}]}),
@@ -1220,6 +1220,113 @@ fn a_kimi_k3_tool_call_emitted_as_text_is_executed_rather_than_rendered() {
             .iter()
             .any(|message| { message["role"] == "assistant" && message["tool_calls"].is_array() }),
         "history must record the recovered call, not the raw tag: {messages:?}"
+    );
+    drop(requests);
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_silent_forced_text_round_still_ends_with_a_message() {
+    let repeated_arguments = json!({"path": "missing.txt"}).to_string();
+    let endpoint = start_fake_endpoint(vec![
+        sse_text_then_tool_call(
+            "Checking the file.",
+            "call_1",
+            "read_file",
+            &repeated_arguments,
+        ),
+        sse_tool_call("call_2", "read_file", &repeated_arguments),
+        sse_tool_call("call_3", "read_file", &repeated_arguments),
+        // The forced no-tools round says nothing, as in the stalled thread.
+        sse_body(&[]),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_silent_stop_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "read it"}],
+        }),
+    );
+    let (response, rendered) = agent.wait_for_prompt(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert!(rendered.contains("Checking the file."), "{rendered:?}");
+    assert!(
+        rendered.contains("same `read_file` call") && rendered.contains("continue"),
+        "the turn ended without telling the user why: {rendered:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn repeated_command_output_calls_remain_available() {
+    let repeated_arguments = json!({"task_id": 999}).to_string();
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "command_output", &repeated_arguments),
+        sse_tool_call("call_2", "command_output", &repeated_arguments),
+        sse_tool_call("call_3", "command_output", &repeated_arguments),
+        sse_text("The background task finished."),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_repeated_poll_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "wait for the background task"}],
+        }),
+    );
+    let (response, rendered) = agent.wait_for_prompt(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+    assert!(rendered.contains("finished"), "got: {rendered:?}");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[3].get("tools").is_some(),
+        "command_output repetition must not force tools off: {:?}",
+        requests[3]
     );
     drop(requests);
 
