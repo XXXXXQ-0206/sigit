@@ -119,3 +119,8 @@ jobs:
 
       - name: Test
         run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Check Windows binary has no VC++ runtime dependency
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/windows/check-static-crt.ps1 -Path target/${{ matrix.target }}/debug/sigit.exe

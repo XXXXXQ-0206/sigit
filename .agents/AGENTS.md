@@ -351,6 +351,14 @@ GitHub release, so `release-github` builds the binaries, attaches the assets, an
 is logged as a warning rather than failing the others, so an unconfigured channel does not block a
 release. Their inputs live in `packaging/`.
 
+The Windows binaries link the MSVC C runtime statically (`+crt-static` in `.cargo/config.toml`).
+winget, Scoop, npm, PyPI and NuGet all ship the bare exe with no installer, so a dynamic build
+that imports `VCRUNTIME140.dll` fails to load on a machine without the VC++ Redistributable
+(`0xC0000135`, which is what failed winget's first validation).
+`packaging/windows/check-static-crt.ps1` runs in CI and in `release-github` and fails the build if
+a Windows exe imports the runtime again. Don't set a `RUSTFLAGS` env var in those workflows: it
+replaces the config rustflags instead of adding to them.
+
 Every release asset now carries a `.sha256` sidecar, not just the macOS Homebrew tarball. Scoop,
 winget, and the AUR PKGBUILD each need one, and they consume the raw binaries rather than the
 tarball. `release-github` also builds a `.deb` and `.rpm` per Linux target with nfpm

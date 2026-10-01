@@ -6,6 +6,8 @@ InstallerType: portable
 # assets are sigit-win-<arch>.exe, but the command has to be `sigit`.
 Commands:
   - sigit
+# No VCRedist dependency: the exe links the C runtime statically
+# (.cargo/config.toml), and CI rejects a build that imports it.
 ReleaseDate: "@RELEASE_DATE@"
 Installers:
   - Architecture: x64
