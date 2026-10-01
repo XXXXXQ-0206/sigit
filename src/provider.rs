@@ -272,10 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_every_cloud_tier_to_an_onde_model_id() {
+    fn maps_every_cloud_tier_to_its_own_onde_model_id() {
         for tier in CLOUD_TIERS {
-            let model = tier_to_model(tier);
-            assert!(model.starts_with("onde-"), "{tier} maps to {model}");
+            // `oke` is the one tier whose wire id is not its own name.
+            let expected = match *tier {
+                "oke" => "onde-kkk".to_string(),
+                name => format!("onde-{name}"),
+            };
+            assert_eq!(tier_to_model(tier), expected);
         }
     }
 }
