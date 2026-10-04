@@ -2296,13 +2296,17 @@ impl SiGitAgent {
                         log::info!("prompt({}) compacted to ≈{} tokens", session_id, after);
                     }
                     Err(error) => {
+                        // Even the deterministic fallback could not fit the
+                        // history in the budget — the session is genuinely
+                        // stuck, so say what is actually recoverable.
                         log::warn!("prompt({}) compaction failed: {error}", session_id);
                         self.send_assistant_message(
                             cx,
                             session_id.clone(),
                             format!(
-                                "This session is too large, and siGit Code could not compact it: \
-                                 {error}. Start a new thread or run `/clear`, then retry."
+                                "This session is too large for the context window, and \
+                                 siGit Code could not shrink it ({error}). Run `/clear` \
+                                 or start a new thread to continue."
                             ),
                         )
                         .ok();
