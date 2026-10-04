@@ -96,40 +96,73 @@ const SUMMARY_TRANSCRIPT_TOKEN_CAP: usize = 12_000;
 /// session started (the original request) and where it stands now. Cutting by
 /// whole lines keeps individual messages intact. A transcript already under
 /// the cap is returned unchanged.
+///
+/// Line boundaries are best-effort: when one side of the cut can't land on a
+/// newline (a transcript of very long lines, or a single huge message), that
+/// side gives up its share rather than the other — the newest exchanges are
+/// the ones the summary can least afford to lose, so the head shrinks to make
+/// room. Both sides failing degrades to keeping only the newest budget.
 fn truncate_transcript_middle(transcript: &str, cap: usize) -> String {
     let budget = cap * 4; // estimate_tokens is chars / 4; invert it.
     if transcript.len() <= budget {
         return transcript.to_string();
     }
-    // Split the budget between head and tail, then walk each inward to a line
-    // boundary so no message is severed mid-line.
-    let half = budget / 2;
-    let mut head_end = half.min(transcript.len());
-    while head_end < transcript.len() && !transcript.is_char_boundary(head_end) {
-        head_end += 1;
-    }
-    let head_end = transcript[..head_end]
-        .rfind('\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
 
-    let mut tail_start = transcript.len().saturating_sub(half);
-    while tail_start > 0 && !transcript.is_char_boundary(tail_start) {
-        tail_start -= 1;
+    let total = transcript.len();
+    // Walk each half to a line boundary. A side with no boundary in reach
+    // contributes nothing; the other side may then use the whole budget.
+    let head_end = {
+        let mut cut = budget.min(total);
+        while cut < total && !transcript.is_char_boundary(cut) {
+            cut += 1;
+        }
+        cut = cut.min(total);
+        if transcript[..cut].contains('\n') {
+            transcript[..cut].rfind('\n').unwrap() + 1
+        } else {
+            0
+        }
+    };
+    let tail_start = {
+        let mut cut = total.saturating_sub(budget);
+        while cut > 0 && !transcript.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if transcript[cut..].contains('\n') {
+            transcript[cut..]
+                .find('\n')
+                .map(|offset| cut + offset + 1)
+                .unwrap()
+        } else {
+            total
+        }
+    };
+
+    if tail_start == total {
+        // The closing exchange has no line boundary in reach (a transcript of
+        // one huge message, or a giant newline-less tool result at the end):
+        // keep the newest budget. A head-only cut would invert the contract
+        // while the placeholder claims older messages were dropped.
+        let mut start = total.saturating_sub(budget);
+        while start > 0 && !transcript.is_char_boundary(start) {
+            start -= 1;
+        }
+        return format!(
+            "{}\n[…older messages omitted…]",
+            transcript[start..].trim_start()
+        );
     }
-    let tail_start = transcript[tail_start..]
-        .find('\n')
-        .map(|offset| tail_start + offset + 1)
-        .unwrap_or(transcript.len());
 
     if head_end >= tail_start {
-        // The cut points crossed (a transcript of very long lines); fall back
-        // to a hard tail cut rather than duplicating content.
-        let mut end = budget.min(transcript.len());
-        while end > 0 && !transcript.is_char_boundary(end) {
-            end -= 1;
+        // No line boundary in reach anywhere: keep the newest budget.
+        let mut start = total.saturating_sub(budget);
+        while start > 0 && !transcript.is_char_boundary(start) {
+            start -= 1;
         }
-        return format!("{}\n[…older messages omitted…]", &transcript[..end]);
+        return format!(
+            "{}\n[…older messages omitted…]",
+            transcript[start..].trim_start()
+        );
     }
 
     let omitted_chars = transcript[head_end..tail_start].chars().count();
@@ -451,24 +484,26 @@ impl InferenceBackend for LocalBackend {
         self.apply_pending_history().await?;
         let snapshot = self.engine.history().await;
 
-        let non_system: Vec<&ChatMessage> = snapshot
+        // Leading system messages carry session context; keep them all.
+        let system: Vec<ChatMessage> = snapshot
             .iter()
+            .take_while(|message| message.role == ChatRole::System)
+            .cloned()
+            .collect();
+        let non_system: Vec<ChatMessage> = snapshot
+            .into_iter()
             .filter(|message| message.role != ChatRole::System)
             .collect();
         let tail_start = non_system.len().saturating_sub(keep_last);
-        let tail: Vec<ChatMessage> = non_system[tail_start..]
-            .iter()
-            .map(|message| (*message).clone())
-            .collect();
+        let tail: Vec<ChatMessage> = non_system[tail_start..].to_vec();
 
-        // One plain (tool-free) inference round produces the summary. The
-        // transcript is capped like the remote path's: an over-budget session
-        // must not send its whole history back into the window that is already
-        // too small for it (issue #125). send_message mutates engine history,
-        // but the clear below wipes whatever it appended, so a failed round
-        // leaves nothing behind.
+        // One plain (tool-free) inference round produces the summary. Note the
+        // cap only bounds this request's own payload: the engine still replays
+        // its full (over-budget) history underneath it, so an already
+        // over-budget local session usually fails here and lands in the
+        // fallback below — the cap is about not making the doomed round worse.
         let transcript = truncate_transcript_middle(
-            &chat_messages_transcript(&snapshot),
+            &chat_messages_transcript(&non_system),
             SUMMARY_TRANSCRIPT_TOKEN_CAP,
         );
         let result = self
@@ -481,11 +516,7 @@ impl InferenceBackend for LocalBackend {
             Ok(result) => {
                 // Local models may reason in <think> blocks; keep only the visible part.
                 let (_think, summary) = crate::chat::strip_think_blocks(&result.text);
-                let mut rebuilt: Vec<ChatMessage> = snapshot
-                    .iter()
-                    .take_while(|message| message.role == ChatRole::System)
-                    .cloned()
-                    .collect();
+                let mut rebuilt = system;
                 rebuilt.push(ChatMessage::user(format!(
                     "[Conversation summary]\n{summary}"
                 )));
@@ -496,38 +527,27 @@ impl InferenceBackend for LocalBackend {
                 log::warn!(
                     "local summarization round failed ({error}); falling back to plain truncation"
                 );
-                let system_json: Option<serde_json::Value> = snapshot
-                    .iter()
-                    .find(|message| message.role == ChatRole::System)
-                    .map(|message| serde_json::json!({
-                        "role": message.role.to_string(),
-                        "content": message.content,
-                    }));
-                let tail_json: Vec<serde_json::Value> = tail
-                    .iter()
-                    .map(|message| serde_json::json!({
-                        "role": message.role.to_string(),
-                        "content": message.content,
-                    }))
-                    .collect();
-                let Some(fallback) =
-                    truncate_history_to_budget(system_json.as_ref(), tail_json)
-                else {
+                // Same deterministic shrink as the remote path, on the plain
+                // chat shapes the engine holds (its history has no tool-call
+                // structure, so there are no orphaned tool results to guard).
+                let system_chars: usize = system.iter().map(|message| message.content.len()).sum();
+                let mut kept: Vec<ChatMessage> = tail;
+                while kept.iter().map(|m| m.content.len()).sum::<usize>() + system_chars
+                    > DEFAULT_CONTEXT_TOKEN_BUDGET * 4
+                    && kept.len() > 1
+                {
+                    kept.remove(0);
+                }
+                if kept.iter().map(|m| m.content.len()).sum::<usize>() + system_chars
+                    > DEFAULT_CONTEXT_TOKEN_BUDGET * 4
+                {
+                    // Even one message overflows the window: unrecoverable.
                     return Err(error);
-                };
-                fallback
-                    .iter()
-                    .filter_map(|entry| {
-                        let role = entry["role"].as_str().unwrap_or("");
-                        let content = entry["content"].as_str().unwrap_or("").to_string();
-                        match role {
-                            "system" => Some(ChatMessage::system(content)),
-                            "user" => Some(ChatMessage::user(content)),
-                            "assistant" => Some(ChatMessage::assistant(content)),
-                            _ => None,
-                        }
-                    })
-                    .collect()
+                }
+                let mut rebuilt = system;
+                rebuilt.push(ChatMessage::user(TRUNCATION_PLACEHOLDER.to_string()));
+                rebuilt.extend(kept);
+                rebuilt
             }
         };
 
@@ -765,14 +785,12 @@ impl OpenAiBackend {
     /// instead of failing the session (issue #125).
     async fn summarize(
         &self,
-        system: Option<&serde_json::Value>,
+        system: &[serde_json::Value],
         transcript: &str,
     ) -> Result<String, BackendError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut messages = Vec::with_capacity(2);
-        if let Some(system) = system {
-            messages.push(system.clone());
-        }
+        let mut messages = Vec::with_capacity(system.len() + 1);
+        messages.extend(system.iter().cloned());
         messages.push(serde_json::json!({
             "role": "user",
             "content": format!("{transcript}\n\n{SUMMARIZE_PROMPT}"),
@@ -1304,10 +1322,13 @@ impl InferenceBackend for OpenAiBackend {
     async fn compact_history(&self, keep_last: usize) -> Result<(), BackendError> {
         let snapshot: Vec<serde_json::Value> = self.history.lock().await.clone();
 
-        let system = snapshot
-            .first()
-            .filter(|message| message["role"] == "system")
-            .cloned();
+        // Leading system messages carry session context (the seeded prompt,
+        // pushed context); keep them all, like the summarization-success path.
+        let system: Vec<serde_json::Value> = snapshot
+            .iter()
+            .take_while(|message| message["role"] == "system")
+            .cloned()
+            .collect();
 
         let non_system: Vec<serde_json::Value> = snapshot
             .iter()
@@ -1338,7 +1359,7 @@ impl InferenceBackend for OpenAiBackend {
             &transcript_for_summary(&snapshot),
             SUMMARY_TRANSCRIPT_TOKEN_CAP,
         );
-        let summary = match self.summarize(system.as_ref(), &transcript).await {
+        let summary = match self.summarize(&system, &transcript).await {
             Ok(summary) => summary,
             Err(error) => {
                 log::warn!(
@@ -1348,17 +1369,14 @@ impl InferenceBackend for OpenAiBackend {
                 // a placeholder and drop the oldest messages until the rebuild
                 // fits the budget. Needs no endpoint, so it cannot fail the way
                 // the inference round just did (issue #125).
-                let rebuilt = truncate_history_to_budget(system.as_ref(), tail.clone())
-                    .ok_or(error)?;
+                let rebuilt = truncate_history_to_budget(&system, tail.clone()).ok_or(error)?;
                 *self.history.lock().await = rebuilt;
                 return Ok(());
             }
         };
 
-        let mut rebuilt = Vec::new();
-        if let Some(system) = system {
-            rebuilt.push(system);
-        }
+        let mut rebuilt = Vec::with_capacity(system.len() + tail.len() + 1);
+        rebuilt.extend(system);
         rebuilt.push(serde_json::json!({
             "role": "user",
             "content": format!("[Conversation summary]\n{summary}"),
@@ -1383,13 +1401,16 @@ const TRUNCATION_PLACEHOLDER: &str = "[Older conversation omitted: the session o
 /// caller then reports the original summarization error and leaves history
 /// untouched.
 fn truncate_history_to_budget(
-    system: Option<&serde_json::Value>,
+    system: &[serde_json::Value],
     mut tail: Vec<serde_json::Value>,
 ) -> Option<Vec<serde_json::Value>> {
     /// A `role: "tool"` entry only makes sense behind the assistant message
     /// that requested it; dropping that message strands it.
     fn drop_orphaned_tool_results(tail: &mut Vec<serde_json::Value>) {
-        while tail.first().is_some_and(|message| message["role"] == "tool") {
+        while tail
+            .first()
+            .is_some_and(|message| message["role"] == "tool")
+        {
             tail.remove(0);
         }
     }
@@ -1398,11 +1419,9 @@ fn truncate_history_to_budget(
     // results whose call message already fell outside the kept window.
     drop_orphaned_tool_results(&mut tail);
 
-    while !tail.is_empty() {
-        let mut candidate = Vec::with_capacity(tail.len() + 2);
-        if let Some(system) = system {
-            candidate.push(system.clone());
-        }
+    loop {
+        let mut candidate = Vec::with_capacity(tail.len() + system.len() + 1);
+        candidate.extend(system.iter().cloned());
         candidate.push(serde_json::json!({
             "role": "user",
             "content": TRUNCATION_PLACEHOLDER,
@@ -1412,8 +1431,9 @@ fn truncate_history_to_budget(
             return Some(candidate);
         }
 
-        if tail.len() == 1 {
-            // One message and it already overflows: nothing left to drop.
+        // Nothing left to drop: even the minimal rebuild (system + placeholder,
+        // no conversation) overflows — the session is genuinely unrecoverable.
+        if tail.is_empty() {
             return None;
         }
         if tail[0]["role"] == "assistant"
@@ -1425,7 +1445,10 @@ fn truncate_history_to_budget(
             // Dropping an assistant tool-call message would orphan its
             // results; drop the whole round (call + results) together.
             let mut end = 1;
-            while tail.get(end).is_some_and(|message| message["role"] == "tool") {
+            while tail
+                .get(end)
+                .is_some_and(|message| message["role"] == "tool")
+            {
                 end += 1;
             }
             tail.drain(..end);
@@ -1434,7 +1457,6 @@ fn truncate_history_to_budget(
             drop_orphaned_tool_results(&mut tail);
         }
     }
-    None
 }
 
 // ── OpenAI error shape ────────────────────────────────────────────────────────
@@ -1726,8 +1748,7 @@ mod tests {
 
     #[test]
     fn a_body_that_is_not_an_error_envelope_keeps_the_status() {
-        let described =
-            describe_api_error(reqwest::StatusCode::BAD_GATEWAY, "upstream said no");
+        let described = describe_api_error(reqwest::StatusCode::BAD_GATEWAY, "upstream said no");
 
         assert!(described.contains("502"), "{described}");
         assert!(described.contains("upstream said no"), "{described}");
@@ -2331,13 +2352,20 @@ mod tests {
     /// the whole window.
     #[tokio::test]
     async fn compact_history_failure_leaves_history_intact() {
-        // No listener at this address: the summarization request fails.
-        let backend =
-            OpenAiBackend::new("http://127.0.0.1:9", "", "test-model", Some("sys".into()));
-        backend.history.lock().await.push(serde_json::json!({
-            "role": "user",
-            "content": "x".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000),
-        }));
+        // No listener at this address, so summarization fails; the system
+        // prompt alone is bigger than the window, so even the minimal
+        // fallback rebuild cannot fit — the genuinely unrecoverable case.
+        let backend = OpenAiBackend::new(
+            "http://127.0.0.1:9",
+            "",
+            "test-model",
+            Some("s".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000)),
+        );
+        backend
+            .history
+            .lock()
+            .await
+            .push(serde_json::json!({ "role": "user", "content": "hello" }));
         let before = backend.history_snapshot().await;
 
         assert!(backend.compact_history(2).await.is_err());
@@ -2388,18 +2416,40 @@ mod tests {
     /// fallback drops nothing beyond what `keep_last` already folded away.
     #[tokio::test]
     async fn truncation_fallback_keeps_the_newest_messages_that_fit() {
-        let system = serde_json::json!({ "role": "system", "content": "sys" });
+        let system = vec![serde_json::json!({ "role": "system", "content": "sys" })];
         let tail: Vec<serde_json::Value> = (0..4)
             .map(|i| serde_json::json!({ "role": "user", "content": format!("m{i}") }))
             .collect();
 
-        let rebuilt = truncate_history_to_budget(Some(&system), tail).unwrap();
+        let rebuilt = truncate_history_to_budget(&system, tail).unwrap();
 
         assert_eq!(rebuilt[0]["role"], "system");
         assert_eq!(rebuilt[1]["content"], TRUNCATION_PLACEHOLDER);
         assert_eq!(rebuilt.len(), 6, "{rebuilt:?}");
         assert_eq!(rebuilt[2]["content"], "m0");
         assert_eq!(rebuilt[5]["content"], "m3");
+    }
+
+    /// A multi-system-message session keeps every leading system message in
+    /// the fallback, exactly like the summarization-success path.
+    #[test]
+    fn truncation_fallback_keeps_all_leading_system_messages() {
+        let system = vec![
+            serde_json::json!({ "role": "system", "content": "seed prompt" }),
+            serde_json::json!({ "role": "system", "content": "session context" }),
+        ];
+        let tail = vec![serde_json::json!({ "role": "user", "content": "hi" })];
+
+        let rebuilt = truncate_history_to_budget(&system, tail).unwrap();
+
+        assert_eq!(
+            rebuilt[0]["content"], "seed prompt",
+            "first system message kept: {rebuilt:?}"
+        );
+        assert_eq!(
+            rebuilt[1]["content"], "session context",
+            "second system message kept: {rebuilt:?}"
+        );
     }
 
     #[test]
@@ -2414,12 +2464,9 @@ mod tests {
             serde_json::json!({ "role": "assistant", "content": "done" }),
         ];
 
-        let rebuilt = truncate_history_to_budget(None, tail).unwrap();
+        let rebuilt = truncate_history_to_budget(&[], tail).unwrap();
 
-        let roles: Vec<&str> = rebuilt
-            .iter()
-            .filter_map(|m| m["role"].as_str())
-            .collect();
+        let roles: Vec<&str> = rebuilt.iter().filter_map(|m| m["role"].as_str()).collect();
         assert_eq!(
             roles,
             ["user", "user", "assistant"],
@@ -2427,15 +2474,45 @@ mod tests {
         );
     }
 
+    /// Review follow-up: a tail that drains to empty (one oversized tool
+    /// round) must still test the minimal rebuild — system + placeholder fits,
+    /// so the session is recoverable, not "unfixable".
+    #[test]
+    fn truncation_fallback_recovers_when_the_whole_tail_was_one_oversized_round() {
+        let system = vec![serde_json::json!({ "role": "system", "content": "sys" })];
+        let tail = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": { "name": "read_file", "arguments": "{}" },
+                }],
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "y".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000),
+            }),
+        ];
+
+        let rebuilt = truncate_history_to_budget(&system, tail).unwrap();
+
+        assert_eq!(rebuilt.len(), 2, "{rebuilt:?}");
+        assert_eq!(rebuilt[0]["role"], "system");
+        assert_eq!(rebuilt[1]["content"], TRUNCATION_PLACEHOLDER);
+    }
+
     #[test]
     fn truncation_fallback_reports_when_nothing_fits() {
-        // A single message bigger than the whole window can never fit.
-        let tail = vec![serde_json::json!({
-            "role": "user",
-            "content": "x".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000),
+        // Even the minimal rebuild (system + placeholder, no conversation)
+        // overflows: the system messages alone are bigger than the window.
+        let system = vec![serde_json::json!({
+            "role": "system",
+            "content": "s".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000),
         })];
 
-        assert!(truncate_history_to_budget(None, tail).is_none());
+        assert!(truncate_history_to_budget(&system, Vec::new()).is_none());
     }
 
     #[test]
@@ -2443,6 +2520,53 @@ mod tests {
         let transcript = "user: hello\n\nassistant: hi";
 
         assert_eq!(truncate_transcript_middle(transcript, 1_000), transcript);
+    }
+
+    /// Review follow-up: a huge final message with no newline in the tail
+    /// half must not be silently dropped — the closing exchange is what the
+    /// summary most needs. The head gives up its share instead.
+    #[test]
+    fn truncate_transcript_middle_keeps_a_newlineless_final_message() {
+        let mut lines: Vec<String> = (0..100).map(|i| format!("user: message {i}")).collect();
+        lines.push(format!(
+            "user: {}current state: pending review",
+            "noise ".repeat(600)
+        ));
+        let transcript = lines.join("\n");
+
+        let trimmed = truncate_transcript_middle(&transcript, 400); // ~1600 chars
+
+        assert!(
+            trimmed.contains("current state: pending review"),
+            "the closing exchange survives: {trimmed}"
+        );
+        assert!(
+            trimmed.contains("older messages omitted"),
+            "the gap is marked: {trimmed}"
+        );
+        assert!(
+            !trimmed.contains("message 0"),
+            "the head gives up its share to the unbreakable tail: {trimmed}"
+        );
+    }
+
+    /// Review follow-up: no newline anywhere in reach — keep the newest
+    /// budget, not the oldest (which would invert the contract while the
+    /// placeholder claims older messages were dropped).
+    #[test]
+    fn truncate_transcript_middle_without_any_newline_keeps_the_newest() {
+        let transcript = format!("old decisions {} current state", "x".repeat(4_000));
+
+        let trimmed = truncate_transcript_middle(&transcript, 200); // ~800 chars
+
+        assert!(
+            trimmed.contains("current state"),
+            "the newest content survives: {trimmed}"
+        );
+        assert!(
+            !trimmed.contains("old decisions"),
+            "the oldest goes when only one side can survive: {trimmed}"
+        );
     }
 
     #[test]
