@@ -752,13 +752,27 @@ async fn list_tools(http: &reqwest::Client, conn: &ServerConn) -> Result<Vec<Mcp
 
 // ── Client-supplied servers (per session) ───────────────────────────────────
 
-/// A stdio server an ACP client passed in `mcpServers` on a session request.
+/// A server an ACP client passed in `mcpServers` on a session request.
 #[derive(Debug, Clone)]
 pub struct ClientServer {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
+    pub transport: ClientTransport,
+}
+
+/// How a client-supplied server is reached. stdio is the transport every ACP
+/// agent must support; Streamable HTTP is the optional one siGit Code
+/// advertises through `mcpCapabilities.http`.
+#[derive(Debug, Clone)]
+pub enum ClientTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 /// The MCP servers one ACP session brought with it, connected.
@@ -766,7 +780,8 @@ pub struct ClientServer {
 /// Unlike the startup servers in [`MCP`], these belong to a session: the
 /// client names them on `session/new` (or load/fork) and they are offered to
 /// that session only. Cheap to clone; the connections are shared. When the
-/// last clone goes away the children's stdin closes and they are killed.
+/// last clone goes away the stdio children's stdin closes and they are killed;
+/// an HTTP server holds nothing open between calls.
 #[derive(Clone, Default)]
 pub struct SessionServers(Arc<Vec<ServerConn>>);
 
@@ -812,10 +827,11 @@ pub async fn connect_session_servers(servers: Vec<ClientServer>) -> SessionServe
     let mut defs = Vec::new();
     for server in servers {
         let name = sanitize(&server.name);
-        let transport = TransportDef::Stdio {
-            command: server.command,
-            args: server.args,
-            env: server.env,
+        let transport = match server.transport {
+            ClientTransport::Stdio { command, args, env } => {
+                TransportDef::Stdio { command, args, env }
+            }
+            ClientTransport::Http { url, headers } => TransportDef::Http { url, headers },
         };
         if name.is_empty() || taken.contains(&name) {
             clashes.push(ServerConn {

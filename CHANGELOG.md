@@ -9,6 +9,14 @@
   the wire. The `unstable_auth_methods` feature is gone because agent auth
   methods are stable in 2.x.
 
+### Added
+
+- **Editors can pass HTTP MCP servers to a session.** siGit Code now
+  advertises `mcpCapabilities.http`, so an ACP client may list Streamable HTTP
+  servers in `mcpServers` next to stdio ones. They are connected with the URL
+  and headers the client sent and are scoped to that session, like the stdio
+  ones. SSE is still not advertised, since the MCP spec deprecated it (#151).
+
 ### Fixed
 
 - **MCP servers the editor passes to a session are connected.** ACP clients

@@ -232,9 +232,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `SessionState` and installs with `set_session_servers` whenever a session becomes live, the
   same way it swaps the roots. `tool_specs`, `call_tool` and `/mcp` read the startup servers and
   then the live session's. A client-supplied server whose name is already taken by a startup
-  server is not connected, since both would claim the same `mcp__<server>__` prefix. HTTP and
-  SSE entries are skipped: `mcpCapabilities` is not advertised, so a conforming client never
-  sends them.
+  server is not connected, since both would claim the same `mcp__<server>__` prefix. Streamable
+  HTTP entries are connected too, with the URL and headers the client sent, because
+  `handle_initialize` advertises `mcpCapabilities.http`. SSE is not advertised (the MCP spec
+  deprecated it), so a conforming client never sends one and a stray entry is skipped.
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all

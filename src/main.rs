@@ -74,16 +74,16 @@ use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
-    Meta, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan,
-    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, UnstructuredCommandInput,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -1476,28 +1476,45 @@ impl SiGitAgent {
     }
 }
 
-/// The stdio servers out of a session request's `mcpServers`.
+/// The servers out of a session request's `mcpServers` that siGit Code can
+/// connect to.
 ///
-/// ACP requires every agent to connect to the stdio ones. HTTP and SSE are
-/// optional and gated on `mcpCapabilities`, which siGit Code does not
-/// advertise, so a client that sends one anyway is told in the log and the
-/// entry is skipped.
+/// ACP requires every agent to connect to the stdio ones. Streamable HTTP is
+/// optional and advertised through `mcpCapabilities.http` in
+/// `handle_initialize`. SSE is not advertised (the MCP spec deprecated it), so
+/// a client that sends one anyway is told in the log and the entry is skipped.
 fn client_mcp_servers(servers: &[McpServer]) -> Vec<mcp::ClientServer> {
     servers
         .iter()
         .filter_map(|server| match server {
             McpServer::Stdio(stdio) => Some(mcp::ClientServer {
                 name: stdio.name.clone(),
-                command: stdio.command.to_string_lossy().into_owned(),
-                args: stdio.args.clone(),
-                env: stdio
-                    .env
-                    .iter()
-                    .map(|var| (var.name.clone(), var.value.clone()))
-                    .collect(),
+                transport: mcp::ClientTransport::Stdio {
+                    command: stdio.command.to_string_lossy().into_owned(),
+                    args: stdio.args.clone(),
+                    env: stdio
+                        .env
+                        .iter()
+                        .map(|var| (var.name.clone(), var.value.clone()))
+                        .collect(),
+                },
+            }),
+            McpServer::Http(http) => Some(mcp::ClientServer {
+                name: http.name.clone(),
+                transport: mcp::ClientTransport::Http {
+                    url: http.url.clone(),
+                    headers: http
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect(),
+                },
             }),
             other => {
-                log::warn!("ignoring a non-stdio MCP server from the client: {other:?}");
+                log::warn!(
+                    "ignoring an MCP server from the client with an unsupported transport: \
+                     {other:?}"
+                );
                 None
             }
         })
@@ -1550,31 +1567,39 @@ impl SiGitAgent {
                 .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
-        Ok(InitializeResponse::new(ProtocolVersion::V1)
-            .agent_info(
-                Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
-                    .title("siGit Code - AI Coding Agent"),
-            )
-            .auth_methods(auth_methods)
-            .agent_capabilities(
-                AgentCapabilities::default()
-                    .load_session(true)
-                    .session_capabilities(
-                    SessionCapabilities::new()
-                        .fork(SessionForkCapabilities::new())
-                        // Durable sessions (`session_store`) are what makes
-                        // listing meaningful: without this the editor's
-                        // "Import Threads" picker reports that the agent
-                        // doesn't support ACP's session/list capability.
-                        .list(SessionListCapabilities::new())
-                        // Without this, a client that has several directories
-                        // open never sends the extra ones: Zed drops every root
-                        // but the first and tells the user the agent has no
-                        // multi-root support. See `workspace.rs`.
-                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
-                ),
-            )
-            .meta(initialize_meta()))
+        Ok(
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_info(
+                    Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
+                        .title("siGit Code - AI Coding Agent"),
+                )
+                .auth_methods(auth_methods)
+                .agent_capabilities(
+                    AgentCapabilities::default()
+                        .load_session(true)
+                        // Clients only pass HTTP MCP servers in `mcpServers` to an
+                        // agent that says it can reach them. SSE stays off: the
+                        // MCP spec deprecated that transport.
+                        .mcp_capabilities(McpCapabilities::new().http(true))
+                        .session_capabilities(
+                            SessionCapabilities::new()
+                                .fork(SessionForkCapabilities::new())
+                                // Durable sessions (`session_store`) are what makes
+                                // listing meaningful: without this the editor's
+                                // "Import Threads" picker reports that the agent
+                                // doesn't support ACP's session/list capability.
+                                .list(SessionListCapabilities::new())
+                                // Without this, a client that has several directories
+                                // open never sends the extra ones: Zed drops every root
+                                // but the first and tells the user the agent has no
+                                // multi-root support. See `workspace.rs`.
+                                .additional_directories(
+                                    SessionAdditionalDirectoriesCapabilities::new(),
+                                ),
+                        ),
+                )
+                .meta(initialize_meta()),
+        )
     }
 
     async fn handle_authenticate(

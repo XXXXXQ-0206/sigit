@@ -491,3 +491,204 @@ fn client_supplied_stdio_server_is_scoped_to_its_session() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+// ── HTTP servers the client supplies ────────────────────────────────────────
+
+/// A Streamable HTTP MCP server with one `echo` tool. Records the
+/// `Authorization` header of every request so the test can check that the
+/// headers the client sent with the server definition reached it.
+struct FakeMcpServer {
+    port: u16,
+    authorizations: Arc<Mutex<Vec<String>>>,
+}
+
+fn start_fake_mcp_server() -> FakeMcpServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake MCP server");
+    let port = listener.local_addr().unwrap().port();
+    let authorizations: Arc<Mutex<Vec<String>>> = Arc::default();
+    let recorded = Arc::clone(&authorizations);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(clone) => clone,
+                Err(_) => continue,
+            });
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim();
+                if line.is_empty() {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(length) = lower.strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap_or(0);
+                }
+                if lower.starts_with("authorization:") {
+                    let value = line["authorization:".len()..].trim().to_string();
+                    recorded.lock().unwrap().push(value);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let Ok(message) = serde_json::from_slice::<Value>(&body) else {
+                continue;
+            };
+
+            let result = match message["method"].as_str().unwrap_or_default() {
+                "initialize" => Some(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fake-http-mcp", "version": "0.0.0"},
+                })),
+                "tools/list" => Some(json!({
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Echo the text back.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    }],
+                })),
+                "tools/call" => {
+                    let text = message["params"]["arguments"]["text"]
+                        .as_str()
+                        .unwrap_or_default();
+                    Some(json!({
+                        "content": [{"type": "text", "text": format!("http:{text}")}],
+                    }))
+                }
+                _ => None,
+            };
+
+            let response = match (message.get("id"), result) {
+                (Some(id), Some(result)) => {
+                    let payload = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                }
+                // Notifications get an empty 202.
+                _ => "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_string(),
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    FakeMcpServer {
+        port,
+        authorizations,
+    }
+}
+
+/// A client only sends HTTP MCP servers to an agent that advertises
+/// `mcpCapabilities.http`, and then expects them connected with the headers it
+/// supplied (issue #151). SSE stays unadvertised.
+#[test]
+fn client_supplied_http_server_is_connected() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "mcp__remote__echo", r#"{"text":"hello"}"#),
+        sse_text("done"),
+    ]);
+    let mcp_server = start_fake_mcp_server();
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_mcp_client_http_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(
+        config_dir.join("mcp.toml"),
+        "official = false\nsmbcloud = false\n",
+    )
+    .unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir, &cwd);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let initialize = agent.wait_for_response(id);
+    let capabilities = &initialize["result"]["agentCapabilities"]["mcpCapabilities"];
+    assert_eq!(
+        capabilities["http"], true,
+        "HTTP MCP servers must be advertised: {initialize}"
+    );
+    assert_eq!(
+        capabilities["sse"], false,
+        "the deprecated SSE transport must stay off: {initialize}"
+    );
+
+    let id = agent.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [{
+                "type": "http",
+                "name": "remote",
+                "url": format!("http://127.0.0.1:{}/mcp", mcp_server.port),
+                "headers": [{"name": "Authorization", "value": "Bearer from-the-editor"}],
+            }],
+        }),
+    );
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "use the remote tool"}],
+        }),
+    );
+    let response = agent.wait_for_response(id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expected exactly two completions");
+    let tools = requests[0]["tools"].to_string();
+    assert!(
+        tools.contains("mcp__remote__echo"),
+        "the HTTP server's tool missing from specs: {tools}"
+    );
+    let messages = requests[1]["messages"].as_array().expect("messages");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+        .expect("tool result for the echo call");
+    assert_eq!(result["content"].as_str().unwrap_or_default(), "http:hello");
+
+    // Every request to the server, handshake and call alike, carried the
+    // header from the server definition.
+    let authorizations = mcp_server.authorizations.lock().unwrap();
+    assert!(
+        authorizations.len() >= 4,
+        "expected initialize, initialized, tools/list and tools/call, got {authorizations:?}"
+    );
+    assert!(
+        authorizations
+            .iter()
+            .all(|value| value == "Bearer from-the-editor"),
+        "the client's headers must reach the server: {authorizations:?}"
+    );
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
