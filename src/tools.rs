@@ -4694,9 +4694,7 @@ mod tests {
     fn write_todos_unknown_status_falls_back_to_pending() {
         let _guard = TODOS_TEST_LOCK.lock().unwrap();
         reset_todos();
-        exec_write_todos(
-            r#"{"todos":[{"content":"weird","status":"bogus"}]}"#,
-        );
+        exec_write_todos(r#"{"todos":[{"content":"weird","status":"bogus"}]}"#);
         let todos = get_todos().expect("list should be persisted");
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].status, TodoStatus::Pending);
