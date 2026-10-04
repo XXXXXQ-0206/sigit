@@ -17,6 +17,12 @@
   one and resolve it against wherever the editor spawned the process. They now
   answer with an invalid-params error (#136).
 
+- **Loading a session that does not exist is an error.** `session/load` with
+  an id that was never saved used to succeed and open an empty session under
+  that id, so the editor showed a blank thread that looked restored. It now
+  answers "not found" (`-32002`). A thread opened in the running process but
+  not spoken in yet still loads (#137).
+
 ## 1.5.13
 
 ### Added

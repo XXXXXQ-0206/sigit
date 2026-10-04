@@ -1889,6 +1889,28 @@ impl SiGitAgent {
         );
 
         let session_key = args.session_id.to_string();
+
+        // The saved copy is the thread; failing that, this process may still
+        // hold one nobody has spoken in yet (nothing is written until a turn
+        // completes). An id found in neither place names no session, and
+        // answering with an empty one would hand the client a blank thread it
+        // cannot tell from a restored one. Parking first makes the in-memory
+        // copy current when the id being loaded is the live session.
+        self.park_active_session().await;
+        let in_memory = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session_key)
+            .map(|state| state.conversation.clone());
+        let Some(history) = session_store::load(&session_key).or(in_memory) else {
+            log::warn!("load_session: no session {session_key}");
+            return Err(agent_client_protocol::Error::new(
+                -32002,
+                format!("session {session_key} not found"),
+            ));
+        };
+
         let mut state = self.session_state(&args.cwd, &args.additional_directories);
         if let Some(model_id) = session_store::list()
             .into_iter()
@@ -1903,29 +1925,26 @@ impl SiGitAgent {
         // editor may still have them open.
         permissions::reset_session(&session_key);
 
-        // Durable sessions: when this session id was saved before, restore its
-        // conversation. The saved system messages are dropped; they are rebuilt
-        // from the roots the editor sent now, which may differ from last time.
-        if let Some(history) = session_store::load(&session_key) {
-            let restored = history.len();
+        // Restore the conversation. The saved system messages are dropped;
+        // they are rebuilt from the roots the editor sent now, which may differ
+        // from last time.
+        let restored = history.len();
 
-            // The client draws the reopened thread from these notifications
-            // alone.
-            let updates = history_replay_updates(&history);
-            let replayed = updates.len();
-            for update in updates {
-                cx.send_notification(SessionNotification::new(args.session_id.clone(), update))
-                    .ok();
-            }
-
-            state.conversation = backend::carryover_history(history);
-            log::info!(
-                "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
-                args.session_id
-            );
+        // The client draws the reopened thread from these notifications alone.
+        let updates = history_replay_updates(&history);
+        let replayed = updates.len();
+        for update in updates {
+            cx.send_notification(SessionNotification::new(args.session_id.clone(), update))
+                .ok();
         }
 
-        self.open_session(&args.session_id, state).await;
+        state.conversation = backend::carryover_history(history);
+        log::info!(
+            "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
+            args.session_id
+        );
+
+        self.open_parked_session(&args.session_id, state).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
