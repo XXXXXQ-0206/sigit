@@ -308,14 +308,17 @@ fn an_error_frame_mid_stream_is_not_swallowed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A failing summarization round must not strand the session (issue #125):
+/// compaction falls back to plain truncation, the pending tool round runs,
+/// and the turn completes instead of ending with "start a new thread".
 #[test]
-fn failed_compaction_in_an_oversized_acp_turn_is_reported_as_chat_text() {
+fn failed_compaction_falls_back_to_truncation_and_the_turn_continues() {
     let dir = scratch("compact");
     let port = start_fake_endpoint(vec![
         sse_tool_call(
             "call_1",
             "run_command",
-            r#"{"command":"echo should-not-run"}"#,
+            r#"{"command":"echo truncation-fallback-works"}"#,
         ),
         upstream_500_reply(),
     ]);
@@ -331,10 +334,16 @@ fn failed_compaction_in_an_oversized_acp_turn_is_reported_as_chat_text() {
 
     assert!(
         response.get("error").is_none(),
-        "compaction failure should be a readable chat message, not an ACP error: {response}"
+        "truncation fallback keeps the turn alive: {response}"
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
 
+    assert!(
+        updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call"),
+        "the pending tool call should run after the truncation fallback: {updates:?}"
+    );
     let rendered = updates
         .iter()
         .filter_map(|update| {
@@ -344,14 +353,8 @@ fn failed_compaction_in_an_oversized_acp_turn_is_reported_as_chat_text() {
         })
         .collect::<String>();
     assert!(
-        rendered.contains("could not compact it: Onde Cloud upstream error (500)"),
-        "wrong rendered message: {rendered:?}"
-    );
-    assert!(
-        !updates
-            .iter()
-            .any(|update| update["sessionUpdate"] == "tool_call"),
-        "tools should not run after compaction fails: {updates:?}"
+        !rendered.contains("could not"),
+        "no compaction-failure banner should be shown when the fallback succeeded: {rendered:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
