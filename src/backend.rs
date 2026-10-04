@@ -109,10 +109,12 @@ fn truncate_transcript_middle(transcript: &str, cap: usize) -> String {
     }
 
     let total = transcript.len();
+    // Each side gets half the budget, so the two together stay inside the cap.
     // Walk each half to a line boundary. A side with no boundary in reach
-    // contributes nothing; the other side may then use the whole budget.
+    // contributes nothing; the newest side may then use the whole budget.
+    let half = budget / 2;
     let head_end = {
-        let mut cut = budget.min(total);
+        let mut cut = half.min(total);
         while cut < total && !transcript.is_char_boundary(cut) {
             cut += 1;
         }
@@ -124,9 +126,9 @@ fn truncate_transcript_middle(transcript: &str, cap: usize) -> String {
         }
     };
     let tail_start = {
-        let mut cut = total.saturating_sub(budget);
-        while cut > 0 && !transcript.is_char_boundary(cut) {
-            cut -= 1;
+        let mut cut = total.saturating_sub(half);
+        while cut < total && !transcript.is_char_boundary(cut) {
+            cut += 1;
         }
         if transcript[cut..].contains('\n') {
             transcript[cut..]
@@ -530,24 +532,11 @@ impl InferenceBackend for LocalBackend {
                 // Same deterministic shrink as the remote path, on the plain
                 // chat shapes the engine holds (its history has no tool-call
                 // structure, so there are no orphaned tool results to guard).
-                let system_chars: usize = system.iter().map(|message| message.content.len()).sum();
-                let mut kept: Vec<ChatMessage> = tail;
-                while kept.iter().map(|m| m.content.len()).sum::<usize>() + system_chars
-                    > DEFAULT_CONTEXT_TOKEN_BUDGET * 4
-                    && kept.len() > 1
-                {
-                    kept.remove(0);
+                match truncate_chat_messages_to_budget(system, tail) {
+                    Some(rebuilt) => rebuilt,
+                    // The system messages alone overflow the window: unrecoverable.
+                    None => return Err(error),
                 }
-                if kept.iter().map(|m| m.content.len()).sum::<usize>() + system_chars
-                    > DEFAULT_CONTEXT_TOKEN_BUDGET * 4
-                {
-                    // Even one message overflows the window: unrecoverable.
-                    return Err(error);
-                }
-                let mut rebuilt = system;
-                rebuilt.push(ChatMessage::user(TRUNCATION_PLACEHOLDER.to_string()));
-                rebuilt.extend(kept);
-                rebuilt
             }
         };
 
@@ -557,6 +546,41 @@ impl InferenceBackend for LocalBackend {
         }
         Ok(())
     }
+}
+
+/// The local counterpart of `truncate_history_to_budget`: system messages, the
+/// truncation placeholder, and the newest of `tail` that fit the budget.
+///
+/// The tail may drain to empty. A newest message that overflows the window on
+/// its own (a giant tool result, the very thing that triggers compaction) is
+/// dropped rather than failing the session, so `None` only means the system
+/// messages alone don't fit.
+fn truncate_chat_messages_to_budget(
+    system: Vec<ChatMessage>,
+    mut tail: Vec<ChatMessage>,
+) -> Option<Vec<ChatMessage>> {
+    let budget = DEFAULT_CONTEXT_TOKEN_BUDGET * 4; // estimate_tokens is chars / 4.
+    let fixed_chars: usize = system
+        .iter()
+        .map(|message| message.content.len())
+        .sum::<usize>()
+        + TRUNCATION_PLACEHOLDER.len();
+    if fixed_chars > budget {
+        return None;
+    }
+
+    let mut tail_chars: usize = tail.iter().map(|message| message.content.len()).sum();
+    let mut drop = 0;
+    while fixed_chars + tail_chars > budget {
+        tail_chars -= tail[drop].content.len();
+        drop += 1;
+    }
+    tail.drain(..drop);
+
+    let mut rebuilt = system;
+    rebuilt.push(ChatMessage::user(TRUNCATION_PLACEHOLDER.to_string()));
+    rebuilt.extend(tail);
+    Some(rebuilt)
 }
 
 /// Flatten `onde` chat messages into the transcript shape summarization
@@ -2513,6 +2537,69 @@ mod tests {
         })];
 
         assert!(truncate_history_to_budget(&system, Vec::new()).is_none());
+    }
+
+    /// Review follow-up: the local fallback recovers from a newest message
+    /// that overflows the window on its own, the same way the remote one does.
+    #[test]
+    fn local_truncation_fallback_drops_an_oversized_final_message() {
+        let system = vec![ChatMessage::system("sys")];
+        let tail = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::user("y".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000)),
+        ];
+
+        let rebuilt = truncate_chat_messages_to_budget(system, tail).unwrap();
+
+        assert_eq!(rebuilt.len(), 2, "{rebuilt:?}");
+        assert_eq!(rebuilt[0].content, "sys");
+        assert_eq!(rebuilt[1].content, TRUNCATION_PLACEHOLDER);
+    }
+
+    #[test]
+    fn local_truncation_fallback_keeps_the_newest_messages_that_fit() {
+        let big = DEFAULT_CONTEXT_TOKEN_BUDGET * 4 / 2;
+        let tail = vec![
+            ChatMessage::user("a".repeat(big)),
+            ChatMessage::user("b".repeat(big)),
+            ChatMessage::user("newest"),
+        ];
+
+        let rebuilt = truncate_chat_messages_to_budget(Vec::new(), tail).unwrap();
+
+        assert_eq!(rebuilt.len(), 3, "oldest dropped, rest kept");
+        assert_eq!(rebuilt[0].content, TRUNCATION_PLACEHOLDER);
+        assert!(rebuilt[1].content.starts_with('b'));
+        assert_eq!(rebuilt[2].content, "newest");
+    }
+
+    #[test]
+    fn local_truncation_fallback_reports_when_the_system_messages_overflow() {
+        let system = vec![ChatMessage::system(
+            "s".repeat(DEFAULT_CONTEXT_TOKEN_BUDGET * 4 + 1000),
+        )];
+
+        assert!(truncate_chat_messages_to_budget(system, Vec::new()).is_none());
+    }
+
+    /// Review follow-up: head and tail share the budget, so the trimmed
+    /// transcript stays near the cap instead of reaching twice it.
+    #[test]
+    fn truncate_transcript_middle_stays_within_the_cap() {
+        let lines: Vec<String> = (0..2_000)
+            .map(|i| format!("user: message {i} with some padding text"))
+            .collect();
+        let transcript = lines.join("\n");
+
+        let trimmed = truncate_transcript_middle(&transcript, 200); // ~800 chars
+
+        assert!(trimmed.contains("message 0 "), "opening kept: {trimmed}");
+        assert!(trimmed.contains("message 1999"), "closing kept: {trimmed}");
+        assert!(
+            trimmed.len() <= 800 + 80,
+            "cap plus the omission marker, got {} chars",
+            trimmed.len()
+        );
     }
 
     #[test]
