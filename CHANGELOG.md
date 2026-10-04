@@ -9,6 +9,14 @@
   the wire. The `unstable_auth_methods` feature is gone because agent auth
   methods are stable in 2.x.
 
+### Fixed
+
+- **A relative `cwd` is rejected when a session starts.** ACP requires the
+  working directory and every `additionalDirectories` entry to be absolute.
+  `session/new`, `session/load` and `session/fork` used to accept a relative
+  one and resolve it against wherever the editor spawned the process. They now
+  answer with an invalid-params error (#136).
+
 ## 1.5.13
 
 ### Added

@@ -1472,6 +1472,33 @@ impl SiGitAgent {
     }
 }
 
+/// Reject session roots that are not absolute paths.
+///
+/// ACP requires `cwd` and every `additionalDirectories` entry to be absolute.
+/// A relative one would otherwise be resolved against wherever the editor
+/// happened to spawn this process, which is not the project the user opened.
+fn validate_session_roots(
+    cwd: &std::path::Path,
+    additional: &[PathBuf],
+) -> agent_client_protocol::Result<()> {
+    if !cwd.is_absolute() {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            format!("cwd must be an absolute path, got {}", cwd.display()),
+        ));
+    }
+    if let Some(relative) = additional.iter().find(|dir| !dir.is_absolute()) {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            format!(
+                "additionalDirectories entries must be absolute paths, got {}",
+                relative.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ── ACP handler implementations ───────────────────────────────────────────────
 
 impl SiGitAgent {
@@ -1849,6 +1876,8 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
+        validate_session_roots(&args.cwd, &args.additional_directories)?;
+
         log::info!(
             "load_session: id={}, cwd={}, additional_directories={:?}",
             args.session_id,
@@ -1919,6 +1948,8 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
+        validate_session_roots(&args.cwd, &args.additional_directories)?;
+
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         log::info!(
             "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
@@ -1986,6 +2017,8 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
+        validate_session_roots(&args.cwd, &args.additional_directories)?;
+
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         log::info!(
             "new_session: id={session_id}, cwd={}, additional_directories={:?}",
@@ -5491,6 +5524,27 @@ mod tests {
     fn longest_backtick_run_finds_the_widest_run() {
         assert_eq!(longest_backtick_run("no backticks here"), 0);
         assert_eq!(longest_backtick_run("one ` two `` three ``` four"), 3);
+    }
+
+    #[test]
+    fn session_roots_must_be_absolute() {
+        let absolute = std::env::temp_dir();
+        let relative = PathBuf::from("relative").join("dir");
+
+        assert!(validate_session_roots(&absolute, &[]).is_ok());
+        assert!(validate_session_roots(&absolute, std::slice::from_ref(&absolute)).is_ok());
+
+        let error = validate_session_roots(&relative, &[]).unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(error.message.contains("cwd"), "{}", error.message);
+
+        let error = validate_session_roots(&absolute, &[absolute.clone(), relative]).unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(
+            error.message.contains("additionalDirectories"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
