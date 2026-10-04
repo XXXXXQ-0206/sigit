@@ -376,16 +376,20 @@ Three of these need credentials or a one-time manual step before they work:
 
 - Scoop needs a `getsigit/scoop-bucket` repo and a `SCOOP_BUCKET_TOKEN` secret, mirroring the
   Homebrew tap setup.
-- winget needs a `WINGET_TOKEN` (**classic PAT** with `public_repo` scope, not a
-  fine-grained PAT — a fine-grained PAT is scoped to specific repos and cannot fork
-  `microsoft/winget-pkgs`, which lives outside its scope; v1.5.13 failed eight times on
-  this) so `wingetcreate` can fork `microsoft/winget-pkgs`. It is passed as
-  `WINGET_CREATE_GITHUB_TOKEN` rather than `--token`,
-  which wingetcreate warns can leak the token into logs. `wingetcreate update` only works on a
-  package that already exists in `microsoft/winget-pkgs`, so the workflow checks the
-  `manifests/g/getSigit/siGitCode` path first and falls back to rendering
-  `packaging/winget/*.yaml.in` and running `wingetcreate submit` for a first submission. That
-  fallback runs once, then every later release takes the `update` path.
+- winget needs a `WINGET_TOKEN` (PAT with `public_repo` scope) so `wingetcreate` can fork
+  `microsoft/winget-pkgs` and open the manifest PR. It is passed as
+  `WINGET_CREATE_GITHUB_TOKEN` rather than `--token`, which wingetcreate warns can leak the
+  token into logs. `wingetcreate update` only works on a package that already exists in
+  `microsoft/winget-pkgs`, so the workflow checks the `manifests/g/getSigit/siGitCode` path
+  first and falls back to rendering `packaging/winget/*.yaml.in` and running
+  `wingetcreate submit` for a first submission. That fallback runs once, then every later
+  release takes the `update` path. Two non-obvious things in the update path: the `--urls`
+  arguments carry a trailing `|x64` / `|arm64` suffix that tells wingetcreate which installer
+  entry each URL replaces — without it, wingetcreate guesses from the file name, and
+  "sigit-win-amd64.exe" is not a spelling it recognises; and the first-submission render
+  uppercases the SHA256 (`tr '[:lower:]' '[:upper:]'`) to match the community validation
+  pipeline, which writes 64-hex checksums uppercase. The update path also passes
+  `--release-date`, `--release-notes-url`, `--submit`, and `--no-open` explicitly.
 - The AUR needs `AUR_USERNAME`, `AUR_EMAIL`, and `AUR_SSH_PRIVATE_KEY`. It publishes `sigit-bin`
   (a prebuilt binary) so Arch users are not compiling the on-device inference stack to install a
   CLI.
