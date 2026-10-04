@@ -1,6 +1,67 @@
 # Changelog
 
-## Unreleased
+## 1.6.0
+
+### Added
+
+- **Editors can pass HTTP MCP servers to a session.** siGit Code now
+  advertises `mcpCapabilities.http`, so an ACP client may list Streamable HTTP
+  servers in `mcpServers` next to stdio ones. They are connected with the URL
+  and headers the client sent and are scoped to that session, like the stdio
+  ones. SSE is still not advertised, since the MCP spec deprecated it (#151).
+
+- **The plan panel survives a failed turn.** The last `write_todos` list is
+  now kept by siGit Code itself. When a turn ends in an endpoint error before
+  the model gets to call `write_todos` again, the saved list is sent to the
+  editor again, so the plan stays on screen where it used to go blank (#132).
+
+### Changed
+
+- **The ACP Rust SDK is now 2.2** (`agent-client-protocol`, up from 1.3).
+  siGit Code still speaks ACP protocol v1 to the editor, so nothing changes on
+  the wire. The `unstable_auth_methods` feature is gone because agent auth
+  methods are stable in 2.x.
+
+### Fixed
+
+- **MCP servers the editor passes to a session are connected.** ACP clients
+  can name MCP servers in `mcpServers` when they open a session, and agents
+  are required to connect to the stdio ones. siGit Code accepted the field and
+  ignored it. The servers are now spawned when the session opens, their tools
+  are offered to that session only, and `/mcp` lists them as coming from the
+  editor. `SIGIT_MCP=off` still turns all of it off (#135).
+
+- **A relative `cwd` is rejected when a session starts.** ACP requires the
+  working directory and every `additionalDirectories` entry to be absolute.
+  `session/new`, `session/load` and `session/fork` used to accept a relative
+  one and resolve it against wherever the editor spawned the process. They now
+  answer with an invalid-params error (#136).
+
+- **Loading a session that does not exist is an error.** `session/load` with
+  an id that was never saved used to succeed and open an empty session under
+  that id, so the editor showed a blank thread that looked restored. It now
+  answers "not found" (`-32002`). A thread opened in the running process but
+  not spoken in yet still loads (#137).
+
+- **Compaction no longer dead-ends a long session.** The summarization request
+  used to carry the whole conversation, which by then was already over the
+  model's window, so siGit Code Cloud timed out with a 504 and the session
+  stopped with "start a new thread". The transcript sent for summarizing is
+  now capped, cut from the middle so the opening request and the latest state
+  are kept. If summarizing still fails, the oldest messages are dropped until
+  the history fits, with whole tool rounds removed together. A failed attempt
+  leaves the conversation as it was (#125).
+
+- **Gateway error pages stay out of the chat.** When an endpoint answers with
+  an HTML error page, the error shown is the status line, not the page's
+  markup (#125).
+
+- **Issue and pull request work no longer assumes GitHub.** The system prompt
+  treated forge features as if every repository lived on GitHub, while the
+  built-in `mcp__sigit__*` tools only work for repositories hosted on
+  sigit.si. The agent now checks the remote first, uses those tools only for
+  sigit.si repositories, and reaches for the forge's own CLI (`gh`, `glab`,
+  `tea`) elsewhere (#127).
 
 ## 1.5.13
 

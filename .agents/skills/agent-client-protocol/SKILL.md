@@ -11,7 +11,7 @@ ACP is a JSON-RPC 2.0 protocol over **stdio** for integrating AI coding agents
 with editors (Zed, JetBrains, Neovim, etc.). The agent runs as a subprocess;
 the editor is the client. Communication is newline-delimited JSON on stdin/stdout.
 
-Crate: `agent-client-protocol = "0.13"` (siGit pins 0.13.0 in `Cargo.lock`)
+Crate: `agent-client-protocol = "2.2"` (siGit pins 2.2.0 in `Cargo.lock`)
 Docs:  https://docs.rs/agent-client-protocol
 Spec:  https://agentclientprotocol.com
 
@@ -20,6 +20,11 @@ Spec:  https://agentclientprotocol.com
 > `Agent` with per-message handler closures and `.connect_to(transport)`. Each
 > handler receives a `ConnectionTo<Client>` (`cx`) you use to send notifications
 > and spawn tasks — so the old mpsc "circular dependency" pattern is gone.
+
+> **SDK 2.x is not protocol v2.** The 2.x crate still speaks ACP protocol v1 by
+> default, which is what siGit and Zed use (`ProtocolVersion::V1`). The draft v2
+> protocol (`Agent.v2()`, `V2ConnectionTo`) sits behind the `unstable_protocol_v2`
+> feature and siGit does not enable it.
 
 siGit's entire ACP server lives in `src/main.rs` (`run_acp_server`, the
 `SiGitAgent` struct, and its `handle_*` methods). Read it alongside this skill.
@@ -30,10 +35,8 @@ siGit's entire ACP server lives in `src/main.rs` (`run_acp_server`, the
 
 ```toml
 [dependencies]
-agent-client-protocol = { version = "0.13", features = [
-    "unstable_session_fork",                   # session/fork support
-    "unstable_session_additional_directories", # additional_directories on session requests
-    "unstable_auth_methods",                   # AuthMethod::Agent etc.
+agent-client-protocol = { version = "2.2", features = [
+    "unstable_session_fork", # session/fork support
 ] }
 async-trait = "0.1"
 tokio       = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
@@ -42,9 +45,12 @@ futures     = "0.3"
 uuid        = { version = "1", features = ["v4"] }
 ```
 
-The `unstable_*` features gate real types/methods (`ForkSessionRequest`,
-`additional_directories`, `AuthMethod::Agent`). Without them the corresponding
-APIs don't exist and you'll get "no variant/method" errors.
+The `unstable_*` features gate real types/methods (`ForkSessionRequest`).
+Without them the corresponding APIs don't exist and you'll get "no
+variant/method" errors. `additional_directories` and `AuthMethod::Agent` used
+to need `unstable_session_additional_directories` and `unstable_auth_methods`;
+both are stable in 2.x and those feature names no longer exist, so listing them
+is a Cargo resolution error.
 
 ---
 
@@ -556,10 +562,9 @@ Editor                                Agent
 8. **Never write to stdout except JSON-RPC** — log to stderr; in TTY mode siGit
    redirects fds to `$TMPDIR/sigit.log`. Any stray `println!` or native library
    stdout write corrupts the wire.
-9. **Unstable features gate real types** — `unstable_session_fork`,
-   `unstable_session_additional_directories`, `unstable_auth_methods` must be on
-   in `Cargo.toml` or `ForkSessionRequest`, `additional_directories`, and
-   `AuthMethod::Agent` won't exist.
+9. **Unstable features gate real types** — `unstable_session_fork` must be on
+   in `Cargo.toml` or `ForkSessionRequest` won't exist. `additional_directories`
+   and `AuthMethod::Agent` are stable in 2.x and need no feature.
 10. **Zed re-fires the last config selection on connect** — make
     `setConfigOption` a no-op when the requested model is already active, and
     never start a model switch while a startup load is still in flight (GPU OOM).

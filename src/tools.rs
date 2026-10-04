@@ -1793,9 +1793,68 @@ fn glob_walk(root: &Path, dir: &Path, re: &Regex, out: &mut Vec<(std::time::Syst
 
 // ── write_todos ──────────────────────────────────────────────────────────────
 
+/// A single todo item as the model sent it, kept around so the panel doesn't
+/// go stale when a later turn omits `write_todos` or errors out before
+/// reaching it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Todo {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "completed" => Self::Completed,
+            "in_progress" => Self::InProgress,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// Process-global todo store. The model owns the list conceptually, but when
+/// it forgets to re-send the full list — an error turn, a context shift, a
+/// simple omission — the panel goes empty with nothing to fall back on. This
+/// keeps the last-known list so `main.rs` can re-emit it.
+/// (`todos_arguments_to_plan` + `SessionUpdate::Plan`) without the model's
+/// help.
+static TODOS: RwLock<Option<Vec<Todo>>> = RwLock::new(None);
+
+/// Read the persisted todo list, if any. Returns `None` when no `write_todos`
+/// call has succeeded yet (or the list was cleared).
+pub fn get_todos() -> Option<Vec<Todo>> {
+    TODOS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Serializes tests that touch the process-global `TODOS` store. Without
+/// this, parallel `cargo test` runs clobber each other's list.
+#[cfg(test)]
+static TODOS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reset the store. Used by tests so one test's list doesn't leak into the
+/// next — the store is process-global.
+#[cfg(test)]
+fn reset_todos() {
+    let mut guard = TODOS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
 /// Renders the model's task checklist back as the tool result so the surface
-/// (TUI / ACP client) can show live progress. Pure presentation — the list is
-/// owned by the model, not persisted here.
+/// (TUI / ACP client) can show live progress. Also persists the list so the
+/// panel survives model omissions and error turns — the list is still owned
+/// by the model, but the last-known state is kept as a fallback.
 fn exec_write_todos(arguments: &str) -> String {
     let args: Value = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -1808,34 +1867,53 @@ fn exec_write_todos(arguments: &str) -> String {
     };
     // An empty list is how the model clears a finished checklist. Rejecting
     // it left the last plan on screen for good, since every other call has to
-    // restate at least one step.
+    // restate at least one step. Clear the store too so a later omission
+    // doesn't bring the old list back from the dead.
     if todos.is_empty() {
+        let mut guard = TODOS
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
         return "Task list cleared.".to_string();
     }
 
     let mut lines = Vec::with_capacity(todos.len());
     let mut completed = 0usize;
+    let mut persisted = Vec::with_capacity(todos.len());
 
     for (idx, todo) in todos.iter().enumerate() {
         let content = match todo.get("content").and_then(Value::as_str) {
             Some(c) => c.trim(),
             None => return format!("Error: todo #{} is missing \"content\"", idx + 1),
         };
-        let status = todo
+        let status_str = todo
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("pending");
+        let status = TodoStatus::from_str(status_str);
 
         let marker = match status {
-            "completed" => {
+            TodoStatus::Completed => {
                 completed += 1;
                 "[x]"
             }
-            "in_progress" => "[~]",
-            _ => "[ ]",
+            TodoStatus::InProgress => "[~]",
+            TodoStatus::Pending => "[ ]",
         };
         lines.push(format!("{marker} {content}"));
+        persisted.push(Todo {
+            content: content.to_string(),
+            status,
+        });
     }
+
+    // Persist the parsed list so the panel survives a later turn that omits
+    // `write_todos` or errors out before reaching it. The store is the
+    // fallback `get_todos()` reads.
+    let mut guard = TODOS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(persisted);
 
     format!(
         "Task list updated ({completed}/{} done):\n{}",
@@ -4563,5 +4641,96 @@ mod tests {
             "message names the type: {err}"
         );
         assert!(err.contains("read-only set"), "message explains why: {err}");
+    }
+
+    // ── write_todos persistence ───────────────────────────────────────────
+    // The store is process-global, so every test acquires `TODOS_TEST_LOCK`
+    // and calls `reset_todos()` first or it inherits whatever the previous
+    // test left behind.
+
+    #[test]
+    fn write_todos_persists_list() {
+        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        reset_todos();
+        assert!(get_todos().is_none());
+
+        let output = exec_write_todos(
+            r#"{"todos":[
+                {"content":"step one","status":"completed"},
+                {"content":"step two","status":"in_progress"},
+                {"content":"step three","status":"pending"}
+            ]}"#,
+        );
+        assert!(output.contains("Task list updated (1/3 done)"));
+
+        let todos = get_todos().expect("list should be persisted");
+        assert_eq!(todos.len(), 3);
+        assert_eq!(todos[0].content, "step one");
+        assert_eq!(todos[0].status, TodoStatus::Completed);
+        assert_eq!(todos[1].status, TodoStatus::InProgress);
+        assert_eq!(todos[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn get_todos_returns_none_after_reset() {
+        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        reset_todos();
+        assert!(get_todos().is_none());
+    }
+
+    #[test]
+    fn write_todos_empty_list_clears_store() {
+        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        // Seed the store so we can prove the empty call wipes it.
+        exec_write_todos(r#"{"todos":[{"content":"seed","status":"pending"}]}"#);
+        assert!(get_todos().is_some());
+
+        let output = exec_write_todos(r#"{"todos":[]}"#);
+        assert_eq!(output, "Task list cleared.");
+        assert!(get_todos().is_none());
+    }
+
+    #[test]
+    fn write_todos_unknown_status_falls_back_to_pending() {
+        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        reset_todos();
+        exec_write_todos(r#"{"todos":[{"content":"weird","status":"bogus"}]}"#);
+        let todos = get_todos().expect("list should be persisted");
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn write_todos_missing_status_defaults_to_pending() {
+        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        reset_todos();
+        exec_write_todos(r#"{"todos":[{"content":"no status"}]}"#);
+        let todos = get_todos().expect("list should be persisted");
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn write_todos_overwrites_previous_list() {
+        let _guard = TODOS_TEST_LOCK.lock().unwrap();
+        reset_todos();
+        exec_write_todos(
+            r#"{"todos":[
+                {"content":"a","status":"pending"},
+                {"content":"b","status":"pending"}
+            ]}"#,
+        );
+        assert_eq!(get_todos().unwrap().len(), 2);
+
+        // A second call with a different list replaces, not appends.
+        exec_write_todos(
+            r#"{"todos":[
+                {"content":"only","status":"completed"}
+            ]}"#,
+        );
+        let todos = get_todos().unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "only");
+        assert_eq!(todos[0].status, TodoStatus::Completed);
     }
 }
