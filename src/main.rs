@@ -634,6 +634,25 @@ fn todos_arguments_to_plan(arguments: &str) -> Option<Plan> {
     Some(Plan::new(entries))
 }
 
+/// Rebuilds an ACP [`Plan`] from the persisted todo list in `tools::get_todos()`.
+/// Used to re-emit the plan on error turns so the client panel stays populated
+/// when the model never got to (or forgot to) call `write_todos` this turn.
+fn persisted_todos_to_plan() -> Option<Plan> {
+    let todos = tools::get_todos()?;
+    let entries = todos
+        .into_iter()
+        .map(|todo| {
+            let status = match todo.status {
+                tools::TodoStatus::Completed => PlanEntryStatus::Completed,
+                tools::TodoStatus::InProgress => PlanEntryStatus::InProgress,
+                tools::TodoStatus::Pending => PlanEntryStatus::Pending,
+            };
+            PlanEntry::new(todo.content, PlanEntryPriority::Medium, status)
+        })
+        .collect();
+    Some(Plan::new(entries))
+}
+
 /// Shown when a siGit Code Cloud tier is selected without a signed-in account.
 const CLOUD_LOGIN_PROMPT: &str = "siGit Code Cloud needs an account. Sign in with \
     `/login <email> <password>` (or the Authenticate button), then pick the tier again. \
@@ -2251,6 +2270,12 @@ impl SiGitAgent {
             }
             Err(DrainTurnError::Backend(error)) => {
                 log::error!("send_message_with_tools failed: {error}");
+                // Re-emit the persisted plan so the client panel doesn't go
+                // empty when the initial inference call fails before the model
+                // can call `write_todos`.
+                if let Some(plan) = persisted_todos_to_plan() {
+                    let _ = self.send_plan_update(cx, session_id.clone(), plan);
+                }
                 // Verbatim, no prefix: the backend has already turned this into
                 // something worth reading (see `describe_api_error`), and it is
                 // what the editor puts in its error banner. The context a
@@ -2532,6 +2557,11 @@ impl SiGitAgent {
                 }
                 Err(DrainTurnError::Backend(error)) => {
                     log::error!("send_tool_results failed: {error}");
+                    // Re-emit the persisted plan so the client panel doesn't go
+                    // empty when a tool round fails mid-turn.
+                    if let Some(plan) = persisted_todos_to_plan() {
+                        let _ = self.send_plan_update(cx, session_id.clone(), plan);
+                    }
                     self.finish_prompt(&session_id, &cancellation);
                     return Err(agent_client_protocol::Error::new(-32603, error));
                 }
