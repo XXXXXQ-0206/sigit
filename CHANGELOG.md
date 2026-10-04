@@ -1,13 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- **The ACP Rust SDK is now 2.2** (`agent-client-protocol`, up from 1.3).
-  siGit Code still speaks ACP protocol v1 to the editor, so nothing changes on
-  the wire. The `unstable_auth_methods` feature is gone because agent auth
-  methods are stable in 2.x.
+## 1.6.0
 
 ### Added
 
@@ -16,6 +9,18 @@
   servers in `mcpServers` next to stdio ones. They are connected with the URL
   and headers the client sent and are scoped to that session, like the stdio
   ones. SSE is still not advertised, since the MCP spec deprecated it (#151).
+
+- **The plan panel survives a failed turn.** The last `write_todos` list is
+  now kept by siGit Code itself. When a turn ends in an endpoint error before
+  the model gets to call `write_todos` again, the saved list is sent to the
+  editor again, so the plan stays on screen where it used to go blank (#132).
+
+### Changed
+
+- **The ACP Rust SDK is now 2.2** (`agent-client-protocol`, up from 1.3).
+  siGit Code still speaks ACP protocol v1 to the editor, so nothing changes on
+  the wire. The `unstable_auth_methods` feature is gone because agent auth
+  methods are stable in 2.x.
 
 ### Fixed
 
@@ -37,6 +42,26 @@
   that id, so the editor showed a blank thread that looked restored. It now
   answers "not found" (`-32002`). A thread opened in the running process but
   not spoken in yet still loads (#137).
+
+- **Compaction no longer dead-ends a long session.** The summarization request
+  used to carry the whole conversation, which by then was already over the
+  model's window, so siGit Code Cloud timed out with a 504 and the session
+  stopped with "start a new thread". The transcript sent for summarizing is
+  now capped, cut from the middle so the opening request and the latest state
+  are kept. If summarizing still fails, the oldest messages are dropped until
+  the history fits, with whole tool rounds removed together. A failed attempt
+  leaves the conversation as it was (#125).
+
+- **Gateway error pages stay out of the chat.** When an endpoint answers with
+  an HTML error page, the error shown is the status line, not the page's
+  markup (#125).
+
+- **Issue and pull request work no longer assumes GitHub.** The system prompt
+  treated forge features as if every repository lived on GitHub, while the
+  built-in `mcp__sigit__*` tools only work for repositories hosted on
+  sigit.si. The agent now checks the remote first, uses those tools only for
+  sigit.si repositories, and reaches for the forge's own CLI (`gh`, `glab`,
+  `tea`) elsewhere (#127).
 
 ## 1.5.13
 
