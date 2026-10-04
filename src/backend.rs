@@ -97,11 +97,11 @@ const SUMMARY_TRANSCRIPT_TOKEN_CAP: usize = 12_000;
 /// whole lines keeps individual messages intact. A transcript already under
 /// the cap is returned unchanged.
 ///
-/// Line boundaries are best-effort: when one side of the cut can't land on a
-/// newline (a transcript of very long lines, or a single huge message), that
-/// side gives up its share rather than the other — the newest exchanges are
-/// the ones the summary can least afford to lose, so the head shrinks to make
-/// room. Both sides failing degrades to keeping only the newest budget.
+/// Line boundaries are best-effort. A head with no newline in its half is
+/// dropped and the tail keeps its own half. A tail with no newline in its half
+/// (a single huge message, or a giant final tool result) can't be cut on a
+/// line, so the newest `cap` worth of text is kept instead and the head goes:
+/// the newest exchanges are the ones the summary can least afford to lose.
 fn truncate_transcript_middle(transcript: &str, cap: usize) -> String {
     let budget = cap * 4; // estimate_tokens is chars / 4; invert it.
     if transcript.len() <= budget {
@@ -110,8 +110,8 @@ fn truncate_transcript_middle(transcript: &str, cap: usize) -> String {
 
     let total = transcript.len();
     // Each side gets half the budget, so the two together stay inside the cap.
-    // Walk each half to a line boundary. A side with no boundary in reach
-    // contributes nothing; the newest side may then use the whole budget.
+    // Walk each half to a line boundary. A head with no boundary in reach
+    // contributes nothing; a tail with none takes the hard cut below.
     let half = budget / 2;
     let head_end = {
         let mut cut = half.min(total);
