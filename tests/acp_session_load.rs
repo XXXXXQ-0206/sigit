@@ -186,6 +186,22 @@ impl AgentUnderTest {
     }
 }
 
+impl AgentUnderTest {
+    /// The raw response to one of our requests, error or not.
+    fn wait_for_raw_response(&mut self, id: u64) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the response to request {id}");
+            };
+            if message["id"] == id && message.get("method").is_none() {
+                return message;
+            }
+        }
+    }
+}
+
 impl Drop for AgentUnderTest {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -314,6 +330,73 @@ fn loading_a_saved_session_replays_it_to_the_client() {
             "system context leaked into the replay: {update}"
         );
     }
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A session id that was never saved and that this process has never opened
+/// names nothing. Answering with an empty session would leave the client
+/// showing a blank thread under the old title (issue #137).
+#[test]
+fn loading_an_unknown_session_is_an_error() {
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_acp_load_unknown_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let project = scratch.join("project");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let port = start_fake_endpoint(Vec::new());
+    let mut agent = spawn_agent(port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response_with_updates(id);
+
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": "does-not-exist", "cwd": project, "mcpServers": []}),
+    );
+    let response = agent.wait_for_raw_response(id);
+    assert_eq!(
+        response["error"]["code"], -32002,
+        "an unknown id must be reported as not found: {response}"
+    );
+
+    // The failed load must not have registered the id as a side effect.
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": "does-not-exist",
+            "prompt": [{"type": "text", "text": "/help"}],
+        }),
+    );
+    let response = agent.wait_for_raw_response(id);
+    assert!(
+        response.get("error").is_some(),
+        "the id must still be unknown after a failed load: {response}"
+    );
+
+    // A thread opened in this process but never spoken in has nothing on disk
+    // yet. It is still a session, so loading it keeps working.
+    let id = agent.request("session/new", json!({"cwd": project, "mcpServers": []}));
+    let (new_session, _) = agent.wait_for_response_with_updates(id);
+    let session_id = new_session["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let id = agent.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": project, "mcpServers": []}),
+    );
+    let response = agent.wait_for_raw_response(id);
+    assert!(
+        response.get("error").is_none(),
+        "a session this process holds must load without a saved copy: {response}"
+    );
 
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);

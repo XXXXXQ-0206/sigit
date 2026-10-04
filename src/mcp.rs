@@ -401,17 +401,22 @@ fn sigit_config_dir() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".config").join("sigit"))
 }
 
+/// Global escape hatch: `SIGIT_MCP=off` disables MCP entirely, including
+/// servers an ACP client supplies per session.
+fn disabled_by_env() -> bool {
+    std::env::var("SIGIT_MCP").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "disabled"
+        )
+    })
+}
+
 /// Resolve the full set of servers to connect to: the baked-in official server
 /// (unless opted out) plus any from `mcp.toml`. Project-local entries override
 /// global ones, and a user entry named `sigit` overrides the official default.
 fn load_configs() -> Vec<ServerDef> {
-    // Global escape hatch: `SIGIT_MCP=off` disables MCP entirely.
-    if let Ok(value) = std::env::var("SIGIT_MCP")
-        && matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        )
-    {
+    if disabled_by_env() {
         log::info!("mcp: disabled via SIGIT_MCP");
         return Vec::new();
     }
@@ -745,6 +750,141 @@ async fn list_tools(http: &reqwest::Client, conn: &ServerConn) -> Result<Vec<Mcp
     Ok(tools)
 }
 
+// ── Client-supplied servers (per session) ───────────────────────────────────
+
+/// A server an ACP client passed in `mcpServers` on a session request.
+#[derive(Debug, Clone)]
+pub struct ClientServer {
+    pub name: String,
+    pub transport: ClientTransport,
+}
+
+/// How a client-supplied server is reached. stdio is the transport every ACP
+/// agent must support; Streamable HTTP is the optional one siGit Code
+/// advertises through `mcpCapabilities.http`.
+#[derive(Debug, Clone)]
+pub enum ClientTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// The MCP servers one ACP session brought with it, connected.
+///
+/// Unlike the startup servers in [`MCP`], these belong to a session: the
+/// client names them on `session/new` (or load/fork) and they are offered to
+/// that session only. Cheap to clone; the connections are shared. When the
+/// last clone goes away the stdio children's stdin closes and they are killed;
+/// an HTTP server holds nothing open between calls.
+#[derive(Clone, Default)]
+pub struct SessionServers(Arc<Vec<ServerConn>>);
+
+impl std::fmt::Debug for SessionServers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|server| &server.name))
+            .finish()
+    }
+}
+
+/// The live session's client-supplied servers. One process serves every
+/// thread the editor has open, so like the roots in `workspace.rs` this
+/// always belongs to the session `main.rs` has installed.
+static SESSION_SERVERS: StdMutex<Option<SessionServers>> = StdMutex::new(None);
+
+/// Connect to the servers a client supplied for one session. Best effort, like
+/// [`init`]: a server that fails its handshake is kept with its error so `/mcp`
+/// can show it, and contributes no tools.
+///
+/// A name already taken by a startup server (or by an earlier entry in the same
+/// list) is not connected. Its tools would share the `mcp__<server>__` prefix
+/// with the other server's, and a call could not be routed.
+pub async fn connect_session_servers(servers: Vec<ClientServer>) -> SessionServers {
+    if servers.is_empty() {
+        return SessionServers::default();
+    }
+    if disabled_by_env() {
+        log::info!(
+            "mcp: ignoring {} client-supplied server(s), disabled via SIGIT_MCP",
+            servers.len()
+        );
+        return SessionServers::default();
+    }
+
+    let http = MCP.get().map(|mcp| mcp.http.clone()).unwrap_or_default();
+    let mut taken: Vec<String> = MCP
+        .get()
+        .map(|mcp| mcp.servers.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
+
+    let mut clashes = Vec::new();
+    let mut defs = Vec::new();
+    for server in servers {
+        let name = sanitize(&server.name);
+        let transport = match server.transport {
+            ClientTransport::Stdio { command, args, env } => {
+                TransportDef::Stdio { command, args, env }
+            }
+            ClientTransport::Http { url, headers } => TransportDef::Http { url, headers },
+        };
+        if name.is_empty() || taken.contains(&name) {
+            clashes.push(ServerConn {
+                endpoint: transport.endpoint(),
+                transport: None,
+                tools: Vec::new(),
+                error: Some(if name.is_empty() {
+                    "the client sent a server with no name".to_string()
+                } else {
+                    format!("another MCP server is already named '{name}'")
+                }),
+                name,
+            });
+            continue;
+        }
+        taken.push(name.clone());
+        defs.push(ServerDef { name, transport });
+    }
+
+    let connects = defs.into_iter().map(|def| {
+        let http = http.clone();
+        async move { connect(&http, def).await }
+    });
+    let mut connected = futures::future::join_all(connects).await;
+    connected.extend(clashes);
+
+    for server in &connected {
+        match &server.error {
+            Some(error) => log::warn!(
+                "mcp: client-supplied server '{}' unavailable: {error}",
+                server.name
+            ),
+            None => log::info!(
+                "mcp: client-supplied server '{}' ready, {} tool(s)",
+                server.name,
+                server.tools.len()
+            ),
+        }
+    }
+
+    SessionServers(Arc::new(connected))
+}
+
+/// Make `servers` the live session's set. Called whenever `main.rs` installs a
+/// session, so a thread never sees another thread's servers.
+pub fn set_session_servers(servers: SessionServers) {
+    *SESSION_SERVERS.lock().unwrap() = Some(servers);
+}
+
+fn session_servers() -> SessionServers {
+    SESSION_SERVERS.lock().unwrap().clone().unwrap_or_default()
+}
+
 // ── Tool exposure + dispatch ────────────────────────────────────────────────
 
 /// Whether a tool name belongs to MCP. The dispatch in `tools::execute_tool`
@@ -754,13 +894,13 @@ pub fn is_mcp_tool(name: &str) -> bool {
 }
 
 /// All discovered MCP tools as agent [`ToolSpec`]s, ready to append to the
-/// built-in tool list. Empty when MCP is uninitialized or no server exposed any.
+/// built-in tool list: the startup servers' tools, then the ones the live
+/// session's client supplied. Empty when no server exposed any.
 pub fn tool_specs() -> Vec<ToolSpec> {
-    let Some(mcp) = MCP.get() else {
-        return Vec::new();
-    };
+    let session = session_servers();
+    let startup = MCP.get().map(|mcp| mcp.servers.as_slice()).unwrap_or(&[]);
     let mut specs = Vec::new();
-    for server in &mcp.servers {
+    for server in startup.iter().chain(session.0.iter()) {
         for tool in &server.tools {
             specs.push(ToolSpec {
                 name: tool.full_name.clone(),
@@ -776,11 +916,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 /// Errors are returned as plain strings (never panics) so a failing tool degrades
 /// to a message the model can react to, exactly like the built-in tools.
 pub async fn call_tool(full_name: &str, arguments: &str) -> String {
-    let Some(mcp) = MCP.get() else {
+    let session = session_servers();
+    let startup = MCP.get().map(|mcp| mcp.servers.as_slice()).unwrap_or(&[]);
+    if MCP.get().is_none() && session.0.is_empty() {
         return "Error: MCP is not initialized.".to_string();
-    };
+    }
 
-    let Some((server, tool)) = mcp.servers.iter().find_map(|s| {
+    let Some((server, tool)) = startup.iter().chain(session.0.iter()).find_map(|s| {
         s.tools
             .iter()
             .find(|t| t.full_name == full_name)
@@ -801,62 +943,63 @@ pub async fn call_tool(full_name: &str, arguments: &str) -> String {
         }
     };
 
-    match mcp.call(server, &tool.remote_name, args).await {
+    let http = MCP.get().map(|mcp| mcp.http.clone()).unwrap_or_default();
+    match call_server(&http, server, &tool.remote_name, args).await {
         Ok(text) => truncate(text),
         Err(error) => format!("Error: {error}"),
     }
 }
 
-impl Mcp {
-    /// Send a `tools/call` and render the result into text. On HTTP, retries
-    /// once after a re-`initialize` if the session was dropped (HTTP 404),
-    /// which is how Streamable HTTP signals an expired session.
-    async fn call(
-        &self,
-        server: &ServerConn,
-        remote_name: &str,
-        args: Value,
-    ) -> Result<String, String> {
-        let params = json!({ "name": remote_name, "arguments": args });
-        let result = match &server.transport {
-            None => return Err(format!("server '{}' is not connected", server.name)),
-            Some(Transport::Stdio(stdio)) => {
-                let timeout = if server.name == "xcode" {
-                    XCODE_CALL_TIMEOUT
-                } else {
-                    CALL_TIMEOUT
-                };
-                stdio.request("tools/call", params, timeout).await?
-            }
-            Some(Transport::Http(http_conn)) => {
-                let body = json!({
-                    "jsonrpc": "2.0",
-                    "id": 0,
-                    "method": "tools/call",
-                    "params": params
-                });
-                let timeout = if server.name == "xcode" {
-                    XCODE_CALL_TIMEOUT
-                } else {
-                    CALL_TIMEOUT
-                };
-                match post_rpc(&self.http, &server.name, http_conn, &body, timeout).await {
-                    Ok(result) => result,
-                    Err(error) if error.contains("returned 404") => {
-                        // Session expired — drop it, re-handshake, and retry once.
-                        *http_conn.session_id.lock().await = None;
-                        initialize(&self.http, server).await?;
-                        notify_initialized(&self.http, server).await?;
-                        post_rpc(&self.http, &server.name, http_conn, &body, timeout).await?
-                    }
-                    Err(error) => return Err(error),
+/// Send a `tools/call` and render the result into text. On HTTP, retries
+/// once after a re-`initialize` if the session was dropped (HTTP 404),
+/// which is how Streamable HTTP signals an expired session.
+async fn call_server(
+    http: &reqwest::Client,
+    server: &ServerConn,
+    remote_name: &str,
+    args: Value,
+) -> Result<String, String> {
+    let params = json!({ "name": remote_name, "arguments": args });
+    let result = match &server.transport {
+        None => return Err(format!("server '{}' is not connected", server.name)),
+        Some(Transport::Stdio(stdio)) => {
+            let timeout = if server.name == "xcode" {
+                XCODE_CALL_TIMEOUT
+            } else {
+                CALL_TIMEOUT
+            };
+            stdio.request("tools/call", params, timeout).await?
+        }
+        Some(Transport::Http(http_conn)) => {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "tools/call",
+                "params": params
+            });
+            let timeout = if server.name == "xcode" {
+                XCODE_CALL_TIMEOUT
+            } else {
+                CALL_TIMEOUT
+            };
+            match post_rpc(http, &server.name, http_conn, &body, timeout).await {
+                Ok(result) => result,
+                Err(error) if error.contains("returned 404") => {
+                    // Session expired — drop it, re-handshake, and retry once.
+                    *http_conn.session_id.lock().await = None;
+                    initialize(http, server).await?;
+                    notify_initialized(http, server).await?;
+                    post_rpc(http, &server.name, http_conn, &body, timeout).await?
                 }
+                Err(error) => return Err(error),
             }
-        };
+        }
+    };
 
-        Ok(render_tool_result(&result))
-    }
+    Ok(render_tool_result(&result))
+}
 
+impl Mcp {
     fn next_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -1059,6 +1202,18 @@ async fn stdio_reader(mut stdout: BufReader<ChildStdout>, shared: Arc<StdioShare
                 "mcp: '{}' answered unknown/expired request id {id}; ignoring",
                 shared.name
             ),
+        }
+    }
+}
+
+impl Drop for StdioConn {
+    /// A connection nobody holds any more has no use for its child. Startup
+    /// servers live in a static and never get here; a session's servers do
+    /// once the session that brought them is replaced.
+    fn drop(&mut self) {
+        // `mark_dead` reaps on a spawned task, which needs a runtime.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.shared.mark_dead("connection closed");
         }
     }
 }
@@ -1326,29 +1481,44 @@ fn parse_sse_response(body: &str) -> Option<Value> {
 /// `/mcp` slash command. Shows the URL for HTTP servers and the command line
 /// for stdio servers.
 pub fn status_summary() -> String {
+    let session = session_servers();
     let Some(mcp) = MCP.get() else {
-        return "MCP is not initialized.".to_string();
+        if session.0.is_empty() {
+            return "MCP is not initialized.".to_string();
+        }
+        return summarize_servers(&[], &session.0);
     };
-    if mcp.servers.is_empty() {
+    if mcp.servers.is_empty() && session.0.is_empty() {
         return "No MCP servers configured. Add one in ~/.config/sigit/mcp.toml \
                 or .sigit/mcp.toml. See https://modelcontextprotocol.io."
             .to_string();
     }
+    summarize_servers(&mcp.servers, &session.0)
+}
 
-    let total_tools: usize = mcp.servers.iter().map(|s| s.tools.len()).sum();
+/// The `/mcp` listing for the startup servers followed by the ones the live
+/// session's client supplied, which are marked as such.
+fn summarize_servers(startup: &[ServerConn], session: &[ServerConn]) -> String {
+    let all = || startup.iter().chain(session.iter());
+    let total_tools: usize = all().map(|s| s.tools.len()).sum();
     let mut lines = vec![format!(
         "{} MCP server(s), {total_tools} tool(s) available:",
-        mcp.servers.len()
+        all().count()
     )];
-    for server in &mcp.servers {
+    for (index, server) in all().enumerate() {
+        let origin = if index >= startup.len() {
+            ", from the editor"
+        } else {
+            ""
+        };
         match &server.error {
             Some(error) => lines.push(format!(
-                "- {} ({}) — unavailable: {error}",
+                "- {} ({}{origin}) — unavailable: {error}",
                 server.name, server.endpoint
             )),
             None => {
                 lines.push(format!(
-                    "- {} ({}) — {} tool(s)",
+                    "- {} ({}{origin}) — {} tool(s)",
                     server.name,
                     server.endpoint,
                     server.tools.len()

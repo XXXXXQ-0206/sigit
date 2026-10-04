@@ -74,15 +74,16 @@ use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -863,6 +864,9 @@ struct SessionState {
     /// project. Stale while the session is live: the backend holds the
     /// current copy then.
     conversation: Vec<serde_json::Value>,
+    /// The MCP servers the client passed in `mcpServers` for this session,
+    /// connected. Installed as the live set along with the roots.
+    mcp_servers: mcp::SessionServers,
 }
 
 struct SiGitAgent {
@@ -1472,6 +1476,78 @@ impl SiGitAgent {
     }
 }
 
+/// The servers out of a session request's `mcpServers` that siGit Code can
+/// connect to.
+///
+/// ACP requires every agent to connect to the stdio ones. Streamable HTTP is
+/// optional and advertised through `mcpCapabilities.http` in
+/// `handle_initialize`. SSE is not advertised (the MCP spec deprecated it), so
+/// a client that sends one anyway is told in the log and the entry is skipped.
+fn client_mcp_servers(servers: &[McpServer]) -> Vec<mcp::ClientServer> {
+    servers
+        .iter()
+        .filter_map(|server| match server {
+            McpServer::Stdio(stdio) => Some(mcp::ClientServer {
+                name: stdio.name.clone(),
+                transport: mcp::ClientTransport::Stdio {
+                    command: stdio.command.to_string_lossy().into_owned(),
+                    args: stdio.args.clone(),
+                    env: stdio
+                        .env
+                        .iter()
+                        .map(|var| (var.name.clone(), var.value.clone()))
+                        .collect(),
+                },
+            }),
+            McpServer::Http(http) => Some(mcp::ClientServer {
+                name: http.name.clone(),
+                transport: mcp::ClientTransport::Http {
+                    url: http.url.clone(),
+                    headers: http
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect(),
+                },
+            }),
+            other => {
+                log::warn!(
+                    "ignoring an MCP server from the client with an unsupported transport: \
+                     {other:?}"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Reject session roots that are not absolute paths.
+///
+/// ACP requires `cwd` and every `additionalDirectories` entry to be absolute.
+/// A relative one would otherwise be resolved against wherever the editor
+/// happened to spawn this process, which is not the project the user opened.
+fn validate_session_roots(
+    cwd: &std::path::Path,
+    additional: &[PathBuf],
+) -> agent_client_protocol::Result<()> {
+    if !cwd.is_absolute() {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            format!("cwd must be an absolute path, got {}", cwd.display()),
+        ));
+    }
+    if let Some(relative) = additional.iter().find(|dir| !dir.is_absolute()) {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            format!(
+                "additionalDirectories entries must be absolute paths, got {}",
+                relative.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ── ACP handler implementations ───────────────────────────────────────────────
 
 impl SiGitAgent {
@@ -1491,31 +1567,39 @@ impl SiGitAgent {
                 .description("Opens sigit.si in your browser to authorize this device."),
         )];
 
-        Ok(InitializeResponse::new(ProtocolVersion::V1)
-            .agent_info(
-                Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
-                    .title("siGit Code - AI Coding Agent"),
-            )
-            .auth_methods(auth_methods)
-            .agent_capabilities(
-                AgentCapabilities::default()
-                    .load_session(true)
-                    .session_capabilities(
-                    SessionCapabilities::new()
-                        .fork(SessionForkCapabilities::new())
-                        // Durable sessions (`session_store`) are what makes
-                        // listing meaningful: without this the editor's
-                        // "Import Threads" picker reports that the agent
-                        // doesn't support ACP's session/list capability.
-                        .list(SessionListCapabilities::new())
-                        // Without this, a client that has several directories
-                        // open never sends the extra ones: Zed drops every root
-                        // but the first and tells the user the agent has no
-                        // multi-root support. See `workspace.rs`.
-                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
-                ),
-            )
-            .meta(initialize_meta()))
+        Ok(
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_info(
+                    Implementation::new("sigit", env!("CARGO_PKG_VERSION"))
+                        .title("siGit Code - AI Coding Agent"),
+                )
+                .auth_methods(auth_methods)
+                .agent_capabilities(
+                    AgentCapabilities::default()
+                        .load_session(true)
+                        // Clients only pass HTTP MCP servers in `mcpServers` to an
+                        // agent that says it can reach them. SSE stays off: the
+                        // MCP spec deprecated that transport.
+                        .mcp_capabilities(McpCapabilities::new().http(true))
+                        .session_capabilities(
+                            SessionCapabilities::new()
+                                .fork(SessionForkCapabilities::new())
+                                // Durable sessions (`session_store`) are what makes
+                                // listing meaningful: without this the editor's
+                                // "Import Threads" picker reports that the agent
+                                // doesn't support ACP's session/list capability.
+                                .list(SessionListCapabilities::new())
+                                // Without this, a client that has several directories
+                                // open never sends the extra ones: Zed drops every root
+                                // but the first and tells the user the agent has no
+                                // multi-root support. See `workspace.rs`.
+                                .additional_directories(
+                                    SessionAdditionalDirectoriesCapabilities::new(),
+                                ),
+                        ),
+                )
+                .meta(initialize_meta()),
+        )
     }
 
     async fn handle_authenticate(
@@ -1580,6 +1664,7 @@ impl SiGitAgent {
             additional_roots: workspace::filter_additional_roots(cwd, additional),
             model_id,
             conversation: Vec::new(),
+            mcp_servers: mcp::SessionServers::default(),
         }
     }
 
@@ -1680,12 +1765,14 @@ impl SiGitAgent {
             additional_roots,
             model_id: _,
             conversation,
+            mcp_servers,
         } = state;
 
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(cwd.clone());
         }
         workspace::replace_additional_roots(additional_roots.clone());
+        mcp::set_session_servers(mcp_servers);
         if cwd.is_dir()
             && let Err(err) = std::env::set_current_dir(&cwd)
         {
@@ -1849,6 +1936,8 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
+        validate_session_roots(&args.cwd, &args.additional_directories)?;
+
         log::info!(
             "load_session: id={}, cwd={}, additional_directories={:?}",
             args.session_id,
@@ -1860,6 +1949,28 @@ impl SiGitAgent {
         );
 
         let session_key = args.session_id.to_string();
+
+        // The saved copy is the thread; failing that, this process may still
+        // hold one nobody has spoken in yet (nothing is written until a turn
+        // completes). An id found in neither place names no session, and
+        // answering with an empty one would hand the client a blank thread it
+        // cannot tell from a restored one. Parking first makes the in-memory
+        // copy current when the id being loaded is the live session.
+        self.park_active_session().await;
+        let in_memory = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session_key)
+            .map(|state| state.conversation.clone());
+        let Some(history) = session_store::load(&session_key).or(in_memory) else {
+            log::warn!("load_session: no session {session_key}");
+            return Err(agent_client_protocol::Error::new(
+                -32002,
+                format!("session {session_key} not found"),
+            ));
+        };
+
         let mut state = self.session_state(&args.cwd, &args.additional_directories);
         if let Some(model_id) = session_store::list()
             .into_iter()
@@ -1874,29 +1985,28 @@ impl SiGitAgent {
         // editor may still have them open.
         permissions::reset_session(&session_key);
 
-        // Durable sessions: when this session id was saved before, restore its
-        // conversation. The saved system messages are dropped; they are rebuilt
-        // from the roots the editor sent now, which may differ from last time.
-        if let Some(history) = session_store::load(&session_key) {
-            let restored = history.len();
+        // Restore the conversation. The saved system messages are dropped;
+        // they are rebuilt from the roots the editor sent now, which may differ
+        // from last time.
+        let restored = history.len();
 
-            // The client draws the reopened thread from these notifications
-            // alone.
-            let updates = history_replay_updates(&history);
-            let replayed = updates.len();
-            for update in updates {
-                cx.send_notification(SessionNotification::new(args.session_id.clone(), update))
-                    .ok();
-            }
-
-            state.conversation = backend::carryover_history(history);
-            log::info!(
-                "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
-                args.session_id
-            );
+        // The client draws the reopened thread from these notifications alone.
+        let updates = history_replay_updates(&history);
+        let replayed = updates.len();
+        for update in updates {
+            cx.send_notification(SessionNotification::new(args.session_id.clone(), update))
+                .ok();
         }
 
-        self.open_session(&args.session_id, state).await;
+        state.conversation = backend::carryover_history(history);
+        state.mcp_servers =
+            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
+        log::info!(
+            "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
+            args.session_id
+        );
+
+        self.open_parked_session(&args.session_id, state).await;
 
         let config_options = {
             let guard = self.current_model.lock().unwrap();
@@ -1919,6 +2029,8 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: ForkSessionRequest,
     ) -> agent_client_protocol::Result<ForkSessionResponse> {
+        validate_session_roots(&args.cwd, &args.additional_directories)?;
+
         let new_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         log::info!(
             "fork_session: from={} new={new_id}, cwd={}, additional_directories={:?}",
@@ -1953,6 +2065,9 @@ impl SiGitAgent {
                 state.model_id = model_id;
             }
         }
+        // A fork gets the servers named on its own request, not the source's.
+        state.mcp_servers =
+            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
         let copied = state.conversation.len();
         let updates = history_replay_updates(&state.conversation);
         let replayed = updates.len();
@@ -1986,6 +2101,8 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         args: NewSessionRequest,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
+        validate_session_roots(&args.cwd, &args.additional_directories)?;
+
         let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
         log::info!(
             "new_session: id={session_id}, cwd={}, additional_directories={:?}",
@@ -1996,7 +2113,9 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let state = self.session_state(&args.cwd, &args.additional_directories);
+        let mut state = self.session_state(&args.cwd, &args.additional_directories);
+        state.mcp_servers =
+            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
         self.open_session(&session_id, state).await;
 
         let config_options = {
@@ -5491,6 +5610,27 @@ mod tests {
     fn longest_backtick_run_finds_the_widest_run() {
         assert_eq!(longest_backtick_run("no backticks here"), 0);
         assert_eq!(longest_backtick_run("one ` two `` three ``` four"), 3);
+    }
+
+    #[test]
+    fn session_roots_must_be_absolute() {
+        let absolute = std::env::temp_dir();
+        let relative = PathBuf::from("relative").join("dir");
+
+        assert!(validate_session_roots(&absolute, &[]).is_ok());
+        assert!(validate_session_roots(&absolute, std::slice::from_ref(&absolute)).is_ok());
+
+        let error = validate_session_roots(&relative, &[]).unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(error.message.contains("cwd"), "{}", error.message);
+
+        let error = validate_session_roots(&absolute, &[absolute.clone(), relative]).unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(
+            error.message.contains("additionalDirectories"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

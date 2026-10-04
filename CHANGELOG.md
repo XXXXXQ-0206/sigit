@@ -9,6 +9,35 @@
   the wire. The `unstable_auth_methods` feature is gone because agent auth
   methods are stable in 2.x.
 
+### Added
+
+- **Editors can pass HTTP MCP servers to a session.** siGit Code now
+  advertises `mcpCapabilities.http`, so an ACP client may list Streamable HTTP
+  servers in `mcpServers` next to stdio ones. They are connected with the URL
+  and headers the client sent and are scoped to that session, like the stdio
+  ones. SSE is still not advertised, since the MCP spec deprecated it (#151).
+
+### Fixed
+
+- **MCP servers the editor passes to a session are connected.** ACP clients
+  can name MCP servers in `mcpServers` when they open a session, and agents
+  are required to connect to the stdio ones. siGit Code accepted the field and
+  ignored it. The servers are now spawned when the session opens, their tools
+  are offered to that session only, and `/mcp` lists them as coming from the
+  editor. `SIGIT_MCP=off` still turns all of it off (#135).
+
+- **A relative `cwd` is rejected when a session starts.** ACP requires the
+  working directory and every `additionalDirectories` entry to be absolute.
+  `session/new`, `session/load` and `session/fork` used to accept a relative
+  one and resolve it against wherever the editor spawned the process. They now
+  answer with an invalid-params error (#136).
+
+- **Loading a session that does not exist is an error.** `session/load` with
+  an id that was never saved used to succeed and open an empty session under
+  that id, so the editor showed a blank thread that looked restored. It now
+  answers "not found" (`-32002`). A thread opened in the running process but
+  not spoken in yet still loads (#137).
+
 ## 1.5.13
 
 ### Added
