@@ -376,8 +376,11 @@ Three of these need credentials or a one-time manual step before they work:
 
 - Scoop needs a `getsigit/scoop-bucket` repo and a `SCOOP_BUCKET_TOKEN` secret, mirroring the
   Homebrew tap setup.
-- winget needs a `WINGET_TOKEN` (PAT with `public_repo`) so `wingetcreate` can fork
-  `microsoft/winget-pkgs`. It is passed as `WINGET_CREATE_GITHUB_TOKEN` rather than `--token`,
+- winget needs a `WINGET_TOKEN` (**classic PAT** with `public_repo` scope, not a
+  fine-grained PAT — a fine-grained PAT is scoped to specific repos and cannot fork
+  `microsoft/winget-pkgs`, which lives outside its scope; v1.5.13 failed eight times on
+  this) so `wingetcreate` can fork `microsoft/winget-pkgs`. It is passed as
+  `WINGET_CREATE_GITHUB_TOKEN` rather than `--token`,
   which wingetcreate warns can leak the token into logs. `wingetcreate update` only works on a
   package that already exists in `microsoft/winget-pkgs`, so the workflow checks the
   `manifests/g/getSigit/siGitCode` path first and falls back to rendering
