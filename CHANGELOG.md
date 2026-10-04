@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- **The ACP Rust SDK is now 2.2** (`agent-client-protocol`, up from 1.3).
+  siGit Code still speaks ACP protocol v1 to the editor, so nothing changes on
+  the wire. The `unstable_auth_methods` feature is gone because agent auth
+  methods are stable in 2.x.
+
 ## 1.5.13
 
 ### Added
