@@ -74,15 +74,16 @@ use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
     ConfigOptionUpdate, ContentBlock, ContentChunk, EmbeddedResourceResource, ForkSessionRequest,
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, Meta,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
+    Meta, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, UnstructuredCommandInput,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -863,6 +864,9 @@ struct SessionState {
     /// project. Stale while the session is live: the backend holds the
     /// current copy then.
     conversation: Vec<serde_json::Value>,
+    /// The MCP servers the client passed in `mcpServers` for this session,
+    /// connected. Installed as the live set along with the roots.
+    mcp_servers: mcp::SessionServers,
 }
 
 struct SiGitAgent {
@@ -1472,6 +1476,34 @@ impl SiGitAgent {
     }
 }
 
+/// The stdio servers out of a session request's `mcpServers`.
+///
+/// ACP requires every agent to connect to the stdio ones. HTTP and SSE are
+/// optional and gated on `mcpCapabilities`, which siGit Code does not
+/// advertise, so a client that sends one anyway is told in the log and the
+/// entry is skipped.
+fn client_mcp_servers(servers: &[McpServer]) -> Vec<mcp::ClientServer> {
+    servers
+        .iter()
+        .filter_map(|server| match server {
+            McpServer::Stdio(stdio) => Some(mcp::ClientServer {
+                name: stdio.name.clone(),
+                command: stdio.command.to_string_lossy().into_owned(),
+                args: stdio.args.clone(),
+                env: stdio
+                    .env
+                    .iter()
+                    .map(|var| (var.name.clone(), var.value.clone()))
+                    .collect(),
+            }),
+            other => {
+                log::warn!("ignoring a non-stdio MCP server from the client: {other:?}");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Reject session roots that are not absolute paths.
 ///
 /// ACP requires `cwd` and every `additionalDirectories` entry to be absolute.
@@ -1607,6 +1639,7 @@ impl SiGitAgent {
             additional_roots: workspace::filter_additional_roots(cwd, additional),
             model_id,
             conversation: Vec::new(),
+            mcp_servers: mcp::SessionServers::default(),
         }
     }
 
@@ -1707,12 +1740,14 @@ impl SiGitAgent {
             additional_roots,
             model_id: _,
             conversation,
+            mcp_servers,
         } = state;
 
         if let Ok(mut guard) = self.session_cwd.lock() {
             *guard = Some(cwd.clone());
         }
         workspace::replace_additional_roots(additional_roots.clone());
+        mcp::set_session_servers(mcp_servers);
         if cwd.is_dir()
             && let Err(err) = std::env::set_current_dir(&cwd)
         {
@@ -1939,6 +1974,8 @@ impl SiGitAgent {
         }
 
         state.conversation = backend::carryover_history(history);
+        state.mcp_servers =
+            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
         log::info!(
             "load_session: restored {restored} message(s), replayed {replayed} update(s) for {}",
             args.session_id
@@ -2003,6 +2040,9 @@ impl SiGitAgent {
                 state.model_id = model_id;
             }
         }
+        // A fork gets the servers named on its own request, not the source's.
+        state.mcp_servers =
+            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
         let copied = state.conversation.len();
         let updates = history_replay_updates(&state.conversation);
         let replayed = updates.len();
@@ -2048,7 +2088,9 @@ impl SiGitAgent {
                 .collect::<Vec<_>>()
         );
 
-        let state = self.session_state(&args.cwd, &args.additional_directories);
+        let mut state = self.session_state(&args.cwd, &args.additional_directories);
+        state.mcp_servers =
+            mcp::connect_session_servers(client_mcp_servers(&args.mcp_servers)).await;
         self.open_session(&session_id, state).await;
 
         let config_options = {

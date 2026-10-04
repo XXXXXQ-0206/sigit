@@ -225,6 +225,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   it's a remote server, the registry's URL-match rule forces a domain namespace (`si.sigit` ↔
   `sigit.si`) verified by a DNS TXT record, not the GitHub-OIDC scheme `smbcloud-cli` uses for its
   package listing.
+  Separate from all of the above are the servers an ACP client passes in `mcpServers` on
+  `session/new`, `session/load` and `session/fork`. ACP requires agents to connect to the stdio
+  ones, and they belong to the session that named them, so they cannot live in the startup
+  global: `connect_session_servers` returns a `SessionServers` that `main.rs` keeps on
+  `SessionState` and installs with `set_session_servers` whenever a session becomes live, the
+  same way it swaps the roots. `tool_specs`, `call_tool` and `/mcp` read the startup servers and
+  then the live session's. A client-supplied server whose name is already taken by a startup
+  server is not connected, since both would claim the same `mcp__<server>__` prefix. HTTP and
+  SSE entries are skipped: `mcpCapabilities` is not advertised, so a conforming client never
+  sends them.
 - **`src/permissions.rs`** — tool permission policy. Every tool call passes through
   `decision_for` before executing: read-only tools always run; mutating tools (and all
   `mcp__*`/unknown tools) are governed by, in order: per-session plan mode (`/plan` — deny all
@@ -261,7 +271,8 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   read another session's roots from the global. Project-local
   discovery reads it: skills, slash commands, subagent types, and instruction files all scan
   every root. MCP is deliberately not on that list — `mcp::init` runs once at startup, before
-  any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell.
+  any session exists, so a second root's `.sigit/mcp.toml` has nobody to tell. (The servers a
+  client names in `mcpServers` are a different thing and are per session; see `src/mcp.rs`.)
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
 - **`src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory

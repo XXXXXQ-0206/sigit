@@ -369,3 +369,125 @@ args = ["--fail"]
     drop(agent);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+// ── Servers the client supplies per session ─────────────────────────────────
+
+/// ACP clients pass MCP servers in `mcpServers` on `session/new`, and every
+/// agent has to connect to the stdio ones (issue #135). The server belongs to
+/// the session that named it: a second session opened without it must not be
+/// offered its tools.
+#[test]
+fn client_supplied_stdio_server_is_scoped_to_its_session() {
+    let stub = env!("CARGO_BIN_EXE_mcp_stdio_stub");
+
+    let endpoint = start_fake_endpoint(vec![
+        // The session without the server: one plain answer.
+        sse_text("nothing to call"),
+        // The session with it: call the tool, then finish.
+        sse_tool_call("call_1", "mcp__editor__echo", r#"{"text":"hello"}"#),
+        sse_text("done"),
+    ]);
+
+    let scratch =
+        std::env::temp_dir().join(format!("sigit_mcp_client_servers_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    // No startup servers at all, so every MCP tool seen below came from the
+    // client.
+    std::fs::write(
+        config_dir.join("mcp.toml"),
+        "official = false\nsmbcloud = false\n",
+    )
+    .unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir, &cwd);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request(
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [{
+                "name": "editor",
+                "command": stub,
+                "args": [],
+                "env": [{"name": "STUB_PREFIX", "value": "ed:"}],
+            }],
+        }),
+    );
+    let with_server = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let without_server = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": without_server,
+            "prompt": [{"type": "text", "text": "anything to call?"}],
+        }),
+    );
+    agent.wait_for_response(id);
+
+    // Switching back to the first session has to bring its server with it.
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": with_server,
+            "prompt": [{"type": "text", "text": "/mcp"}],
+        }),
+    );
+    let (_, listing) = agent.wait_for_response_collecting_updates(id);
+    assert!(
+        listing.contains("mcp__editor__echo") && listing.contains("from the editor"),
+        "/mcp must list the client-supplied server and say where it came from, got: {listing}"
+    );
+
+    let id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": with_server,
+            "prompt": [{"type": "text", "text": "use the editor tool"}],
+        }),
+    );
+    let response = agent.wait_for_response(id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "expected exactly three completions");
+
+    let tools = requests[0]["tools"].to_string();
+    assert!(
+        !tools.contains("mcp__editor__"),
+        "a session must not be offered another session's server: {tools}"
+    );
+    let tools = requests[1]["tools"].to_string();
+    assert!(
+        tools.contains("mcp__editor__echo"),
+        "the client-supplied server's tool missing from specs: {tools}"
+    );
+
+    // The call round-trips, and the env the client sent reached the child.
+    let messages = requests[2]["messages"].as_array().expect("messages");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_1")
+        .expect("tool result for the echo call");
+    assert_eq!(result["content"].as_str().unwrap_or_default(), "ed:hello");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

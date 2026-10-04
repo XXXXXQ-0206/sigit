@@ -11,6 +11,13 @@
 
 ### Fixed
 
+- **MCP servers the editor passes to a session are connected.** ACP clients
+  can name MCP servers in `mcpServers` when they open a session, and agents
+  are required to connect to the stdio ones. siGit Code accepted the field and
+  ignored it. The servers are now spawned when the session opens, their tools
+  are offered to that session only, and `/mcp` lists them as coming from the
+  editor. `SIGIT_MCP=off` still turns all of it off (#135).
+
 - **A relative `cwd` is rejected when a session starts.** ACP requires the
   working directory and every `additionalDirectories` entry to be absolute.
   `session/new`, `session/load` and `session/fork` used to accept a relative
