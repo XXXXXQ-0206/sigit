@@ -199,10 +199,15 @@ fn transcript_for_summary(history: &[serde_json::Value]) -> String {
         }
 
         let mut parts: Vec<String> = Vec::new();
-        if let Some(text) = message["content"].as_str()
-            && !text.trim().is_empty()
-        {
-            parts.push(text.to_string());
+        let text = message_text(message);
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+        // A summary cannot carry a picture, but it should say one was there.
+        match message_image_count(message) {
+            0 => {}
+            1 => parts.push("[attached an image]".to_string()),
+            count => parts.push(format!("[attached {count} images]")),
         }
         for call in message["tool_calls"].as_array().into_iter().flatten() {
             parts.push(format!(
@@ -225,11 +230,54 @@ fn transcript_for_summary(history: &[serde_json::Value]) -> String {
 /// Deliberately model-agnostic — it only needs to be in the right ballpark to
 /// decide when compaction is worth an extra inference round.
 pub fn estimate_tokens(history: &[serde_json::Value]) -> usize {
-    let chars: usize = history
-        .iter()
-        .map(|message| message.to_string().chars().count())
-        .sum();
-    chars / 4
+    let mut chars = 0;
+    let mut images = 0;
+    for message in history {
+        let image_count = message_image_count(message);
+        if image_count == 0 {
+            chars += message.to_string().chars().count();
+        } else {
+            // An image travels as base64, megabytes of it, but a model bills
+            // it by resolution. Counting the payload as text would put every
+            // session with one screenshot permanently over budget.
+            chars += message_text(message).chars().count();
+            images += image_count;
+        }
+    }
+    chars / 4 + images * IMAGE_TOKEN_ESTIMATE
+}
+
+/// What one attached image is assumed to cost. Providers land between a few
+/// hundred and a couple of thousand tokens depending on resolution; like the
+/// rest of [`estimate_tokens`] this only has to be in the right ballpark.
+const IMAGE_TOKEN_ESTIMATE: usize = 1_000;
+
+/// The text of a history message. `content` is a plain string for almost every
+/// message; a user message that carries an image uses OpenAI's content-part
+/// array instead, and its text parts are joined here.
+pub fn message_text(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// How many images a history message carries as `image_url` content parts.
+pub fn message_image_count(message: &serde_json::Value) -> usize {
+    message["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "image_url")
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// A sink for streaming assistant text deltas to the UI as they are produced.
@@ -341,7 +389,9 @@ impl LocalBackend {
         self.engine.clear_history().await;
         for entry in history {
             let role = entry["role"].as_str().unwrap_or("");
-            let content = entry["content"].as_str().unwrap_or("").to_string();
+            // The on-device engine keeps text only, so an image attached
+            // while a cloud model was active stays behind here.
+            let content = message_text(&entry);
             // Tool-call-only assistant entries and empty tool results carry no
             // text a plain chat history can replay; drop them.
             if content.is_empty() && role != "user" && role != "system" {
@@ -1695,7 +1745,7 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
                         if let Some(object) = message.as_object_mut() {
                             object.remove("tool_calls");
                         }
-                        if message["content"].as_str().unwrap_or_default().is_empty() {
+                        if message_text(&message).is_empty() {
                             continue;
                         }
                     } else {
@@ -2050,6 +2100,63 @@ mod tests {
         let history = new_backend.history_snapshot().await;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["content"], "new prompt");
+    }
+
+    fn user_with_image(text: &str, payload_chars: usize) -> serde_json::Value {
+        serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": text },
+                { "type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{}", "A".repeat(payload_chars)),
+                }},
+            ],
+        })
+    }
+
+    #[test]
+    fn message_text_reads_both_content_shapes() {
+        assert_eq!(
+            message_text(&serde_json::json!({ "role": "user", "content": "hello" })),
+            "hello"
+        );
+        let with_image = user_with_image("what is this?", 16);
+        assert_eq!(message_text(&with_image), "what is this?");
+        assert_eq!(message_image_count(&with_image), 1);
+        // A tool-call-only assistant message has no content at all.
+        let no_content = serde_json::json!({ "role": "assistant", "content": null });
+        assert_eq!(message_text(&no_content), "");
+        assert_eq!(message_image_count(&no_content), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_does_not_count_an_image_payload_as_text() {
+        // Two megabytes of base64 would read as half a million tokens.
+        let history = vec![user_with_image("what is this?", 2_000_000)];
+        let estimate = estimate_tokens(&history);
+        assert!(
+            (IMAGE_TOKEN_ESTIMATE..IMAGE_TOKEN_ESTIMATE + 100).contains(&estimate),
+            "{estimate}"
+        );
+    }
+
+    #[test]
+    fn summary_transcript_keeps_the_text_of_a_message_with_an_image() {
+        let transcript = transcript_for_summary(&[user_with_image("what is this?", 64)]);
+        assert!(transcript.contains("what is this?"), "{transcript}");
+        assert!(transcript.contains("[attached an image]"), "{transcript}");
+        assert!(!transcript.contains("base64"), "{transcript}");
+    }
+
+    #[test]
+    fn carryover_keeps_a_user_message_that_carries_an_image() {
+        let carried = carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            user_with_image("what is this?", 16),
+            serde_json::json!({ "role": "assistant", "content": "a cat" }),
+        ]);
+        assert_eq!(carried.len(), 2);
+        assert_eq!(message_image_count(&carried[0]), 1);
     }
 
     #[test]
