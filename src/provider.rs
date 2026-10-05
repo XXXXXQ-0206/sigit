@@ -45,6 +45,40 @@ pub const CLOUD_TIERS: &[&str] = &[
 
 pub const DEFAULT_CLOUD_TIER: &str = "nova";
 
+/// Cloud tiers that read images attached to a prompt.
+///
+/// This mirrors onde-cloud's `IMAGE_CANDIDATES` table, which is where the
+/// per-provider facts live and where a request is actually accepted or
+/// refused. A tier is listed here when at least one of its providers takes
+/// images. The rest are text-only at the source: `nova` and `orbit` (GLM-5.3
+/// and GLM-5.2), `apex` and `flux` (DeepSeek V4 Pro and V4 Flash).
+///
+/// The list can be hard-coded because the tier list itself is: a tier this
+/// client does not know is not offered at all (see [`CLOUD_TIERS`]).
+const IMAGE_TIERS: &[&str] = &[
+    "fast", "balanced", "large", "mini", "air", "pro", "oke", "aura", "flare", "zenith", "prism",
+];
+
+/// Whether the cloud tier `tier` reads images.
+pub fn tier_accepts_images(tier: &str) -> bool {
+    IMAGE_TIERS.contains(&tier.trim().to_lowercase().as_str())
+}
+
+/// Whether the model id sent on the wire reads images.
+///
+/// An `onde-*` id is one of our tiers and is answered from [`IMAGE_TIERS`]. Any
+/// other id belongs to an endpoint the user configured themselves
+/// (`OPENAI_BASE_URL` or a provider profile). Nothing is known about those, so
+/// the image is passed through and the endpoint gets to decide.
+pub fn model_accepts_images(model: &str) -> bool {
+    if !model.starts_with("onde-") {
+        return true;
+    }
+    CLOUD_TIERS
+        .iter()
+        .any(|tier| tier_to_model(tier) == model && tier_accepts_images(tier))
+}
+
 /// Base URL of the siGit Code Cloud inference endpoint. Override with
 /// `SIGIT_CLOUD_URL` (dev: `http://localhost:8090/v1`).
 pub fn cloud_base_url() -> String {
@@ -280,6 +314,28 @@ mod tests {
                 name => format!("onde-{name}"),
             };
             assert_eq!(tier_to_model(tier), expected);
+        }
+    }
+
+    #[test]
+    fn image_support_follows_the_tier_table() {
+        assert!(tier_accepts_images("large"));
+        assert!(tier_accepts_images("oke"));
+        // The default tier is text-only at the source.
+        assert!(!tier_accepts_images(DEFAULT_CLOUD_TIER));
+        assert!(!tier_accepts_images("apex"));
+
+        assert!(model_accepts_images("onde-large"));
+        // `oke` is the one tier whose wire id is not `onde-<tier>`.
+        assert!(model_accepts_images("onde-kkk"));
+        assert!(!model_accepts_images("onde-nova"));
+        // An onde id this client has never heard of is not assumed to work.
+        assert!(!model_accepts_images("onde-something-new"));
+        // A model on the user's own endpoint is theirs to judge.
+        assert!(model_accepts_images("gpt-4o-mini"));
+
+        for tier in IMAGE_TIERS {
+            assert!(CLOUD_TIERS.contains(tier), "{tier} is not a cloud tier");
         }
     }
 }

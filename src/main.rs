@@ -76,8 +76,8 @@ use agent_client_protocol::schema::v1::{
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
+    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
     SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
@@ -89,8 +89,8 @@ use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder}
 use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
-    InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult, ToolSpec,
-    TurnResult,
+    ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult,
+    ToolSpec, TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1512,6 +1512,76 @@ impl SiGitAgent {
     }
 }
 
+/// Session and model pairs already told that earlier images are hidden, so
+/// the note about a model switch is shown once and not on every prompt.
+static IMAGE_GAP_NOTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Decide what happens to a prompt's images for the model about to answer.
+///
+/// The editor can attach an image whatever model is selected, because ACP
+/// fixes `promptCapabilities.image` for the whole connection. Returns the text
+/// and images to send, plus a note for the user when something is being left
+/// out:
+///
+/// - the model cannot read images and the prompt has some: they are dropped,
+///   the user is told, and the model is told too, so it does not answer as if
+///   it had seen them;
+/// - the model cannot read images and the thread has some from before a model
+///   switch (`earlier_images`): the user is told once per session and model.
+fn images_for_turn(
+    mut user_text: String,
+    images: Vec<ImageInput>,
+    accepts_images: bool,
+    model_name: &str,
+    earlier_images: usize,
+    session_id: &str,
+) -> (String, Vec<ImageInput>, Option<String>) {
+    if accepts_images {
+        return (user_text, images, None);
+    }
+
+    const HINT: &str = "Models marked \"reads images\" in the model picker can.";
+    let plural = |count: usize| if count == 1 { "image" } else { "images" };
+
+    if !images.is_empty() {
+        let count = images.len();
+        if !user_text.is_empty() {
+            user_text.push_str("\n\n");
+        }
+        user_text.push_str(&format!(
+            "[The user attached {count} {}. This model cannot read images, so it was not \
+             included. Say so if the request depends on it.]",
+            plural(count)
+        ));
+        let notice = format!(
+            "> **Image not sent.** {model_name} cannot read images, so the {count} attached {} \
+             left out of this message. {HINT}",
+            if count == 1 {
+                "image was"
+            } else {
+                "images were"
+            }
+        );
+        return (user_text, Vec::new(), Some(notice));
+    }
+
+    if earlier_images > 0 {
+        let key = (session_id.to_string(), model_name.to_string());
+        let mut noted = IMAGE_GAP_NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(&key) {
+            noted.push(key);
+            let notice = format!(
+                "> **Earlier images are hidden.** {model_name} cannot read images, so the \
+                 {earlier_images} {} attached earlier in this thread {} not sent to it. {HINT}",
+                plural(earlier_images),
+                if earlier_images == 1 { "is" } else { "are" }
+            );
+            return (user_text, images, Some(notice));
+        }
+    }
+    (user_text, images, None)
+}
+
 /// The servers out of a session request's `mcpServers` that siGit Code can
 /// connect to.
 ///
@@ -1613,6 +1683,11 @@ impl SiGitAgent {
                 .agent_capabilities(
                     AgentCapabilities::default()
                         .load_session(true)
+                        // Lets the editor attach images to a prompt. The capability is fixed
+                        // for the connection while the model is not, so a prompt that
+                        // brings an image to a model that cannot read one is answered with
+                        // a note instead (see `images_for_turn`).
+                        .prompt_capabilities(PromptCapabilities::new().image(true))
                         // Clients only pass HTTP MCP servers in `mcpServers` to an
                         // agent that says it can reach them. SSE stays off: the
                         // MCP spec deprecated that transport.
@@ -2230,11 +2305,18 @@ impl SiGitAgent {
         }
 
         let mut parts: Vec<String> = Vec::new();
+        let mut images: Vec<ImageInput> = Vec::new();
 
         for block in &args.prompt {
             match block {
                 ContentBlock::Text(t) => {
                     parts.push(t.text.clone());
+                }
+                ContentBlock::Image(image) => {
+                    images.push(ImageInput {
+                        mime_type: image.mime_type.clone(),
+                        data: image.data.clone(),
+                    });
                 }
                 ContentBlock::Resource(embedded) => {
                     // editor inlined the file content already
@@ -2314,7 +2396,7 @@ impl SiGitAgent {
 
         let user_text = parts.join("\n");
 
-        if user_text.trim().is_empty() {
+        if user_text.trim().is_empty() && images.is_empty() {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
@@ -2399,6 +2481,34 @@ impl SiGitAgent {
         let tools = agent_tools_as_specs();
         let max_tool_rounds = headless::max_tool_rounds_from_env();
 
+        let model_name = self.current_model.lock().unwrap().display_name.clone();
+        let earlier_images = if backend.accepts_images() {
+            0
+        } else {
+            backend
+                .history_snapshot()
+                .await
+                .iter()
+                .map(backend::message_image_count)
+                .sum()
+        };
+        let (user_text, images, notice) = images_for_turn(
+            user_text,
+            images,
+            backend.accepts_images(),
+            &model_name,
+            earlier_images,
+            &session_id.to_string(),
+        );
+        if let Some(notice) = notice {
+            self.send_assistant_message(
+                cx,
+                session_id.clone(),
+                format!("{notice}{PARAGRAPH_BREAK}"),
+            )
+            .ok();
+        }
+
         // Token sink: backends stream assistant text through this while a turn
         // runs. We forward the visible portion to the editor as agent-message
         // chunks live (see `drain_turn` / `emit_visible_chunk`). The sink stays
@@ -2421,7 +2531,7 @@ impl SiGitAgent {
             .drain_turn(
                 cx,
                 &session_id,
-                backend.send_message_with_tools(&user_text, &tools, Some(&sink)),
+                backend.send_message_with_images(&user_text, &images, &tools, Some(&sink)),
                 &mut sink_rx,
                 &mut reply,
                 &cancellation,
@@ -3621,6 +3731,16 @@ fn build_config_options(
             }
             if item.tool_calling {
                 desc_parts.push("tool calling".to_string());
+            }
+            // The editor offers image attachments for every model, because
+            // the capability is per connection. This is where the user can see
+            // which models will actually look at one.
+            if item
+                .cloud_tier
+                .as_deref()
+                .is_some_and(provider::tier_accepts_images)
+            {
+                desc_parts.push("reads images".to_string());
             }
             desc_parts.push(format!(
                 "{} context",
@@ -5764,6 +5884,52 @@ mod tests {
     fn longest_backtick_run_finds_the_widest_run() {
         assert_eq!(longest_backtick_run("no backticks here"), 0);
         assert_eq!(longest_backtick_run("one ` two `` three ``` four"), 3);
+    }
+
+    fn png() -> ImageInput {
+        ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        }
+    }
+
+    #[test]
+    fn images_go_through_untouched_to_a_model_that_reads_them() {
+        let (text, images, notice) =
+            images_for_turn("look".to_string(), vec![png()], true, "Large", 3, "s-pass");
+        assert_eq!(text, "look");
+        assert_eq!(images.len(), 1);
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn a_text_only_model_gets_a_note_and_the_user_is_told() {
+        let (text, images, notice) =
+            images_for_turn("look".to_string(), vec![png()], false, "Nova", 0, "s-drop");
+        assert!(images.is_empty());
+        assert!(
+            text.starts_with("look\n\n[The user attached 1 image."),
+            "{text}"
+        );
+        let notice = notice.expect("the user must be told the image was left out");
+        assert!(notice.contains("Nova cannot read images"), "{notice}");
+        assert!(notice.contains("reads images"), "{notice}");
+    }
+
+    #[test]
+    fn switching_to_a_text_only_model_is_flagged_once() {
+        let turn = || images_for_turn("next".to_string(), Vec::new(), false, "Nova", 2, "s-switch");
+
+        let (text, _, notice) = turn();
+        assert_eq!(text, "next", "nothing is added to a prompt with no image");
+        let notice = notice.expect("earlier images going out of view must be flagged");
+        assert!(notice.contains("2 images attached earlier"), "{notice}");
+
+        let (_, _, again) = turn();
+        assert!(
+            again.is_none(),
+            "the note is shown once, not on every prompt"
+        );
     }
 
     #[test]
