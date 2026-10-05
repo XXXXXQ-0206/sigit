@@ -248,7 +248,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   overrides and the default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`,
   default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`, the ACP path sends
   `session/request_permission` (allow once / allow for session / deny) and the TUI pauses the
-  inference task on a y/a/n prompt. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
+  inference task on a y/a/n prompt. On the ACP path the decision is taken *before* the call is
+  announced, because it sets the announced status: a call that will ask starts `pending`, the
+  permission request carries that call's own id, and an `in_progress` update follows approval.
+  That update also puts the card's title back, since the permission request overwrites it
+  with the full arguments. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
   serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
   answer mid-turn — don't move them back inline, and don't await client requests from inline
   handlers (deadlock).

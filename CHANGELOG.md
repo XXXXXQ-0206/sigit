@@ -17,6 +17,13 @@
   (`content_filter`) with `refusal`. A refused turn is also taken out of the
   conversation, which is what the protocol tells the client to expect (#140).
 
+- **A tool call that needs approval is one card, not two.** The permission
+  request carried an id of its own, so an ACP client showed an approval card
+  beside a call that already claimed to be running. The call is now announced
+  as `pending`, the permission request names that same call, and it moves to
+  `in_progress` once approved. Calls allowed by policy still start out
+  `in_progress` (#138).
+
 - **A headless run no longer ends silently with no final message.** When the
   last round came back empty, which is what happens when a run is cut off at
   the tool-round cap mid-task, stdout was empty and the exit status was 0, so

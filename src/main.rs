@@ -2494,6 +2494,39 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
+                let signature = format!("{}\n{}", tc.name, tc.arguments);
+                let repeat_count = repeated_tool_calls
+                    .entry(signature)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                // Repeated status checks are expected for a live background
+                // command. command_output long-polls and the overall round cap
+                // still bounds a confused model without cutting off a real
+                // build or release while it is in progress.
+                let repeated = *repeat_count >= 3 && tc.name != "command_output";
+                if repeated {
+                    force_text = true;
+                    stopped_repeating = Some(tc.name.clone());
+                    log::warn!(
+                        "prompt({}) stopping repeated tool call `{}` after {} attempts",
+                        session_id,
+                        tc.name,
+                        repeat_count
+                    );
+                }
+
+                // Decided before the call is announced, because the answer sets
+                // the status it is announced with: a call that has to wait for
+                // the user starts out `pending`, everything else is already
+                // running. A repeated call is never run, so never asked about.
+                let decision = (!repeated).then(|| {
+                    permissions::decision_for(&session_id.to_string(), &tc.name, &tc.arguments)
+                });
+                let announced_status = match decision {
+                    Some(permissions::Decision::Ask) => ToolCallStatus::Pending,
+                    _ => ToolCallStatus::InProgress,
+                };
+
                 // Only treat the call as a plan once its arguments have actually
                 // produced one. Keying off the tool name alone means a
                 // `write_todos` the converter rejects sends no plan *and* skips
@@ -2525,7 +2558,7 @@ impl SiGitAgent {
                         SessionUpdate::ToolCall(
                             ToolCall::new(tc.id.clone(), chat::tool_title(&tc.name, &tc.arguments))
                                 .kind(tool_kind_for(&tc.name))
-                                .status(ToolCallStatus::InProgress)
+                                .status(announced_status)
                                 .content(vec![invocation_content])
                                 .locations(tool_call_locations(&tc.name, &tc.arguments))
                                 .raw_input(raw_input),
@@ -2534,41 +2567,15 @@ impl SiGitAgent {
                     .ok();
                 }
 
-                let signature = format!("{}\n{}", tc.name, tc.arguments);
-                let repeat_count = repeated_tool_calls
-                    .entry(signature)
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-                // Repeated status checks are expected for a live background
-                // command. command_output long-polls and the overall round cap
-                // still bounds a confused model without cutting off a real
-                // build or release while it is in progress.
-                let repeated = *repeat_count >= 3 && tc.name != "command_output";
-                if repeated {
-                    force_text = true;
-                    stopped_repeating = Some(tc.name.clone());
-                    log::warn!(
-                        "prompt({}) stopping repeated tool call `{}` after {} attempts",
-                        session_id,
-                        tc.name,
-                        repeat_count
-                    );
-                }
-
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
-                let output = if repeated {
-                    format!(
+                let output = match decision {
+                    None => format!(
                         "The tool `{}` was not executed again because the model repeated \
                          the same call three times. Continue without this tool.",
                         tc.name
-                    )
-                } else {
-                    match permissions::decision_for(
-                        &session_id.to_string(),
-                        &tc.name,
-                        &tc.arguments,
-                    ) {
+                    ),
+                    Some(decision) => match decision {
                         permissions::Decision::Allow => {
                             tools::execute_tool(&tc.name, &tc.arguments).await
                         }
@@ -2578,10 +2585,36 @@ impl SiGitAgent {
                         }
                         permissions::Decision::Ask => {
                             match self
-                                .request_tool_permission(cx, &session_id, &tc.name, &tc.arguments)
+                                .request_tool_permission(
+                                    cx,
+                                    &session_id,
+                                    &tc.id,
+                                    &tc.name,
+                                    &tc.arguments,
+                                )
                                 .await
                             {
                                 PermissionVerdict::Approved => {
+                                    // The call the user just approved leaves
+                                    // `pending` here. The title goes back to
+                                    // the card's own: the permission request
+                                    // replaced it with the full arguments.
+                                    if !render_as_plan {
+                                        self.send_tool_call_update(
+                                            cx,
+                                            session_id.clone(),
+                                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                                tc.id.clone(),
+                                                ToolCallUpdateFields::new()
+                                                    .status(ToolCallStatus::InProgress)
+                                                    .title(chat::tool_title(
+                                                        &tc.name,
+                                                        &tc.arguments,
+                                                    )),
+                                            )),
+                                        )
+                                        .ok();
+                                    }
                                     tools::execute_tool(&tc.name, &tc.arguments).await
                                 }
                                 PermissionVerdict::Denied(reason) => {
@@ -2632,7 +2665,7 @@ impl SiGitAgent {
                                 }
                             }
                         }
-                    }
+                    },
                 };
 
                 log::info!("  ← {} chars", output.len());
@@ -2798,7 +2831,9 @@ impl SiGitAgent {
         Ok(PromptResponse::new(stop_reason))
     }
 
-    /// Ask the ACP client for permission to run one tool call. Presents
+    /// Ask the ACP client for permission to run one tool call. The request
+    /// names the call by `tool_call_id`, the id it was announced under, so the
+    /// client updates that one card instead of drawing a second. Presents
     /// allow-once / allow-for-session / deny; an "always allow" choice is
     /// recorded via [`permissions::grant_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
@@ -2807,6 +2842,7 @@ impl SiGitAgent {
         &self,
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
+        tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
     ) -> PermissionVerdict {
@@ -2828,7 +2864,7 @@ impl SiGitAgent {
         let request = RequestPermissionRequest::new(
             session_id.clone(),
             ToolCallUpdate::new(
-                format!("perm-{}", uuid::Uuid::new_v4()),
+                tool_call_id.to_string(),
                 ToolCallUpdateFields::new()
                     .title(title)
                     .kind(tool_kind_for(tool_name))
