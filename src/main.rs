@@ -297,6 +297,27 @@ fn stop_reason_for(round_cap_reached: bool, finish: backend::FinishReason) -> St
     }
 }
 
+/// What the user sees when a turn stops at the tool-round cap. Always sent,
+/// whatever the last round said: with no tools on offer that round tends to be
+/// the model announcing its next step ("Now commit:"), which reads as a stall
+/// when nothing follows it (issue #120).
+fn round_cap_stop_message(max_tool_rounds: usize) -> String {
+    format!(
+        "I stopped here because this turn used all {max_tool_rounds} of its tool rounds,          so the task may not be finished. Reply \"continue\" to pick it back up."
+    )
+}
+
+/// Appended to the last tool result of the round that reaches the cap. Without
+/// it the model has no way to know the tools are gone, so it spends its final
+/// reply saying what it is about to do instead of where things stand.
+fn round_cap_note(max_tool_rounds: usize) -> String {
+    format!(
+        "\n\n[siGit Code] That was tool round {max_tool_rounds} of {max_tool_rounds} for \
+         this turn, so no more tools can run until the user replies. Do not announce a next \
+         action. Say briefly what is done and what is left."
+    )
+}
+
 /// What the user sees when a turn that ran tools ends with no closing text.
 fn silent_stop_message(repeated_tool: Option<&str>, rounds: usize) -> String {
     match repeated_tool {
@@ -2373,9 +2394,10 @@ impl SiGitAgent {
 
         // ── tool-calling loop ────────────────────────────────────────────
         // send message → execute any tool calls → feed results back
-        // repeat up to MAX_TOOL_ROUNDS, then force a text reply
+        // repeat up to the tool-round cap, then force a text reply
 
         let tools = agent_tools_as_specs();
+        let max_tool_rounds = headless::max_tool_rounds_from_env();
 
         // Token sink: backends stream assistant text through this while a turn
         // runs. We forward the visible portion to the editor as agent-message
@@ -2435,7 +2457,7 @@ impl SiGitAgent {
         // end of the turn can tell whether that round said anything at all.
         let mut sent_before_last_round = 0;
 
-        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+        while !result.tool_calls.is_empty() && round < max_tool_rounds {
             if cancellation.cancelled.load(Ordering::Acquire) {
                 self.finish_prompt(&session_id, &cancellation);
                 return Ok(PromptResponse::new(StopReason::Cancelled));
@@ -2708,7 +2730,11 @@ impl SiGitAgent {
                 }
             }
 
-            let allow_tool_calls = round < MAX_TOOL_ROUNDS && !force_text;
+            let round_cap_reached = round >= max_tool_rounds;
+            let allow_tool_calls = !round_cap_reached && !force_text;
+            if round_cap_reached && let Some(last) = tool_results.last_mut() {
+                last.content.push_str(&round_cap_note(max_tool_rounds));
+            }
 
             // Whatever this round says starts a new paragraph rather than
             // continuing the sentence the tool calls interrupted.
@@ -2752,10 +2778,14 @@ impl SiGitAgent {
         // If anything streamed, the visible reply is already on the wire; only
         // send a trailing block for the non-streamed path (e.g. on-device direct
         // answers, which onde can't stream while tools are on offer).
+        let round_cap_reached = round >= max_tool_rounds;
         if !reply.streamed_any {
             let reply_text = result.text.trim().to_string();
             let final_text = if reply_text.is_empty() {
-                if round > 0 {
+                if round_cap_reached {
+                    // The cap notice below covers it.
+                    String::new()
+                } else if round > 0 {
                     log::warn!(
                         "prompt({}) — model returned empty reply after {} tool round(s)",
                         session_id,
@@ -2779,7 +2809,7 @@ impl SiGitAgent {
                 self.send_assistant_message(cx, session_id.clone(), final_text)
                     .ok();
             }
-        } else if round > 0 && reply.sent.len() == sent_before_last_round {
+        } else if round > 0 && !round_cap_reached && reply.sent.len() == sent_before_last_round {
             // Earlier rounds streamed text, but the last one (typically the
             // forced no-tools round) said nothing. Without a closing message
             // the turn just stops, and the user can't tell whether it ended,
@@ -2800,7 +2830,24 @@ impl SiGitAgent {
             .ok();
         }
 
-        let stop_reason = stop_reason_for(round >= MAX_TOOL_ROUNDS, result.finish);
+        if round_cap_reached {
+            log::warn!(
+                "prompt({}) stopped at the cap of {} tool round(s)",
+                session_id,
+                max_tool_rounds
+            );
+            self.send_assistant_message(
+                cx,
+                session_id.clone(),
+                format!(
+                    "{PARAGRAPH_BREAK}{}",
+                    round_cap_stop_message(max_tool_rounds)
+                ),
+            )
+            .ok();
+        }
+
+        let stop_reason = stop_reason_for(round_cap_reached, result.finish);
 
         // ACP defines a refusal as a turn the next prompt will not include:
         // the client drops the user message and everything after it from its

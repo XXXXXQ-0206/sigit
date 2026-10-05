@@ -132,6 +132,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `max_turn_requests`, `length` is `max_tokens`, `content_filter` is `refusal`. ACP defines a
   refusal as a turn the next prompt will not include, so `handle_prompt` restores the history
   it snapshotted before the turn instead of only relabelling the response.
+  The round that reaches the cap (24, or `SIGIT_MAX_TOOL_ROUNDS`) is followed by one forced
+  text reply with no tools. The model cannot see that the tools are gone, so
+  `round_cap_note` is appended to that round's last tool result, and the turn always closes
+  with `round_cap_stop_message`. Without both, the thread stops on the model announcing a
+  step that never runs (issue #120).
   Some models write tool calls into content as text; `src/inline_tool_calls.rs` recovers the
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
@@ -346,7 +351,8 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+`SIGIT_MODEL`, `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
+headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
 smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),

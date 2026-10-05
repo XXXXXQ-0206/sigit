@@ -113,6 +113,14 @@ struct AgentUnderTest {
 }
 
 fn spawn_agent(port: u16, config_dir: &std::path::Path) -> AgentUnderTest {
+    spawn_agent_with_env(port, config_dir, &[])
+}
+
+fn spawn_agent_with_env(
+    port: u16,
+    config_dir: &std::path::Path,
+    env: &[(&str, &str)],
+) -> AgentUnderTest {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sigit"))
         .env("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"))
         .env("OPENAI_API_KEY", "test-key")
@@ -121,6 +129,8 @@ fn spawn_agent(port: u16, config_dir: &std::path::Path) -> AgentUnderTest {
         .env("SIGIT_MCP", "off")
         .env("SIGIT_PERMISSIONS", "allow")
         .env_remove("SIGIT_LOCAL_INFERENCE")
+        .env_remove("SIGIT_MAX_TOOL_ROUNDS")
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -194,14 +204,39 @@ impl AgentUnderTest {
 
     /// Send one text prompt and return the stop reason the turn ended with.
     fn prompt(&mut self, session_id: &str, text: &str) -> String {
+        self.prompt_with_reply(session_id, text).0
+    }
+
+    /// Like [`Self::prompt`], also returning the assistant text the client
+    /// was sent on the way, joined the way a client renders it.
+    fn prompt_with_reply(&mut self, session_id: &str, text: &str) -> (String, String) {
         let id = self.request(
             "session/prompt",
             json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
         );
-        self.wait_for_response(id)["result"]["stopReason"]
-            .as_str()
-            .expect("stop reason")
-            .to_string()
+        let mut rendered = String::new();
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(message) = self.incoming.recv_timeout(remaining) else {
+                panic!("timed out waiting for the response to request {id}");
+            };
+            let update = &message["params"]["update"];
+            if message["method"] == "session/update"
+                && update["sessionUpdate"] == "agent_message_chunk"
+                && let Some(chunk) = update["content"]["text"].as_str()
+            {
+                rendered.push_str(chunk);
+            }
+            if message["id"] == id && message.get("method").is_none() {
+                assert!(message.get("error").is_none(), "prompt failed: {message}");
+                let stop_reason = message["result"]["stopReason"]
+                    .as_str()
+                    .expect("stop reason")
+                    .to_string();
+                return (stop_reason, rendered);
+            }
+        }
     }
 }
 
@@ -314,6 +349,91 @@ fn a_turn_stopped_at_the_tool_round_cap_ends_with_max_turn_requests() {
         TOOL_ROUND_CAP + 1,
         "one request per tool round, plus the forced closing reply"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// What issue #120 looked like from the editor: the turn reached the cap, the
+/// model used its last reply to announce the next step, the call behind it was
+/// dropped, and the thread stopped on "Now commit:" with nothing after it.
+#[test]
+fn a_turn_stopped_at_the_cap_says_so_to_the_user_and_the_model() {
+    let dir = scratch("cap_notice");
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo round-1"}"#),
+        sse_tool_call("call_2", "run_command", r#"{"command":"echo round-2"}"#),
+        sse_text("Now commit:", "stop"),
+    ]);
+    let mut agent = spawn_agent_with_env(
+        endpoint.port,
+        &dir.join("config"),
+        &[("SIGIT_MAX_TOOL_ROUNDS", "2")],
+    );
+    let session_id = agent.open_session(&dir.join("work"));
+
+    let (stop_reason, reply) = agent.prompt_with_reply(&session_id, "ship it");
+
+    assert_eq!(stop_reason, "max_turn_requests");
+    assert!(
+        reply.contains("Now commit:") && reply.contains("all 2 of its tool rounds"),
+        "the user must be told why the turn stopped: {reply:?}"
+    );
+
+    // The model is told before its last reply, on the result of the last
+    // call, and only there.
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let tool_results = |request: &Value| -> Vec<String> {
+        request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let before_cap = tool_results(&requests[1]);
+    assert!(
+        before_cap
+            .iter()
+            .all(|content| !content.contains("[siGit Code]")),
+        "no note while rounds remain: {before_cap:?}"
+    );
+    let at_cap = tool_results(&requests[2]);
+    assert!(
+        at_cap.last().is_some_and(|content| {
+            content.contains("round-2") && content.contains("no more tools can run")
+        }),
+        "the last tool result carries the note: {at_cap:?}"
+    );
+    assert!(
+        requests[2].get("tools").is_none(),
+        "the closing round offers no tools: {}",
+        requests[2]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A turn that finishes inside its rounds gets no notice.
+#[test]
+fn a_turn_that_finishes_inside_the_cap_gets_no_notice() {
+    let dir = scratch("under_cap");
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call("call_1", "run_command", r#"{"command":"echo round-1"}"#),
+        sse_text("Committed.", "stop"),
+    ]);
+    let mut agent = spawn_agent_with_env(
+        endpoint.port,
+        &dir.join("config"),
+        &[("SIGIT_MAX_TOOL_ROUNDS", "2")],
+    );
+    let session_id = agent.open_session(&dir.join("work"));
+
+    let (stop_reason, reply) = agent.prompt_with_reply(&session_id, "ship it");
+
+    assert_eq!(stop_reason, "end_turn");
+    assert_eq!(reply.trim(), "Committed.");
 
     std::fs::remove_dir_all(&dir).ok();
 }

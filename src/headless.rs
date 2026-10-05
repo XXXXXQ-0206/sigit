@@ -72,7 +72,8 @@ pub struct HeadlessConfig {
 /// Upper bound for `--max-tool-rounds` / `SIGIT_MAX_TOOL_ROUNDS`.
 pub const MAX_TOOL_ROUNDS_LIMIT: usize = 500;
 
-/// Environment override for the tool-round cap of a headless run.
+/// Environment override for the tool-round cap of a headless run or an ACP
+/// prompt turn.
 pub const MAX_TOOL_ROUNDS_ENV: &str = "SIGIT_MAX_TOOL_ROUNDS";
 
 fn parse_tool_rounds(value: &str, source: &str) -> Result<usize, String> {
@@ -94,6 +95,20 @@ fn resolve_max_tool_rounds(flag: Option<usize>, env: Option<&str>) -> Result<usi
         Some(value) => parse_tool_rounds(value, MAX_TOOL_ROUNDS_ENV),
         None => Ok(crate::MAX_TOOL_ROUNDS),
     }
+}
+
+/// The tool-round cap for a surface with no flag of its own (an ACP prompt
+/// turn). A value that does not parse is logged and ignored: the editor
+/// launched the agent, so there is nobody to show a startup error to.
+pub fn max_tool_rounds_from_env() -> usize {
+    resolve_max_tool_rounds(None, std::env::var(MAX_TOOL_ROUNDS_ENV).ok().as_deref())
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "{error}; using the built-in cap of {}",
+                crate::MAX_TOOL_ROUNDS
+            );
+            crate::MAX_TOOL_ROUNDS
+        })
 }
 
 /// What the model is told when a run would otherwise end with no final
