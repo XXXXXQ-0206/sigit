@@ -58,6 +58,36 @@ pub struct ToolResult {
 pub struct TurnResult {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Why the model stopped. Only the last round of a turn decides how the
+    /// turn is reported; a round that goes on to run tools is not the end.
+    pub finish: FinishReason,
+}
+
+/// Why the model stopped generating, reduced to what the agent loop acts on.
+/// Endpoints report it as `finish_reason`; without it a reply cut off at the
+/// token limit is indistinguishable from one the model finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FinishReason {
+    /// The model finished on its own: `stop`, `tool_calls`, or no reason given.
+    #[default]
+    Complete,
+    /// The output ran into the token limit, so the reply is cut short.
+    Length,
+    /// The endpoint withheld the reply instead of answering.
+    ContentFilter,
+}
+
+impl FinishReason {
+    /// Map a wire `finish_reason`. OpenAI's spellings are `length` and
+    /// `content_filter`; gateways in front of other providers sometimes pass
+    /// the upstream's own word through, so those are accepted too.
+    fn from_wire(reason: Option<&str>) -> Self {
+        match reason {
+            Some("length" | "max_tokens") => Self::Length,
+            Some("content_filter" | "refusal") => Self::ContentFilter,
+            _ => Self::Complete,
+        }
+    }
 }
 
 /// Backend errors are plain strings. Callers map them to ACP errors.
@@ -603,6 +633,7 @@ async fn drain_onde_stream(
     sink: &TokenSink,
 ) -> Result<TurnResult, BackendError> {
     let mut text = String::new();
+    let mut finish = FinishReason::default();
     while let Some(chunk) = rx.recv().await {
         if !chunk.delta.is_empty() {
             text.push_str(&chunk.delta);
@@ -613,23 +644,26 @@ async fn drain_onde_stream(
             }
         }
         if chunk.done {
-            if let Some(reason) = chunk.finish_reason
+            if let Some(reason) = chunk.finish_reason.as_deref()
                 && let Some(message) = reason.strip_prefix("error: ")
             {
                 return Err(message.to_string());
             }
+            finish = FinishReason::from_wire(chunk.finish_reason.as_deref());
             break;
         }
     }
     Ok(TurnResult {
         text,
         tool_calls: Vec::new(),
+        finish,
     })
 }
 
 /// Convert an `onde` tool-aware result into the neutral [`TurnResult`].
 fn onde_result_to_turn(result: onde::inference::ToolAwareResult) -> TurnResult {
     TurnResult {
+        finish: FinishReason::from_wire(Some(&result.finish_reason)),
         text: result.text,
         tool_calls: result
             .tool_calls
@@ -747,6 +781,7 @@ impl OpenAiBackend {
         Ok(TurnResult {
             text: join_reply_text(&result.text, &retry.text),
             tool_calls: retry.tool_calls,
+            finish: retry.finish,
         })
     }
 
@@ -865,12 +900,13 @@ impl OpenAiBackend {
             .await
             .map_err(|error| format!("response parse error: {error}"))?;
 
-        let message = parsed
+        let choice = parsed
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
+        let finish = FinishReason::from_wire(choice.finish_reason.as_deref());
+        let message = choice.message;
 
         let mut text = message.content.clone().unwrap_or_default();
         let mut tool_calls: Vec<ToolCall> = message
@@ -913,6 +949,7 @@ impl OpenAiBackend {
                 TurnResult {
                     text,
                     tool_calls: Vec::new(),
+                    finish,
                 },
                 malformed,
             ));
@@ -951,6 +988,7 @@ impl OpenAiBackend {
                     TurnResult {
                         text: cleaned,
                         tool_calls,
+                        finish,
                     },
                     malformed,
                 ));
@@ -963,6 +1001,7 @@ impl OpenAiBackend {
                     TurnResult {
                         text: cleaned,
                         tool_calls,
+                        finish,
                     },
                     malformed,
                 ));
@@ -992,6 +1031,7 @@ impl OpenAiBackend {
                 TurnResult {
                     text: extracted.text,
                     tool_calls,
+                    finish,
                 },
                 malformed,
             ));
@@ -1000,7 +1040,14 @@ impl OpenAiBackend {
         // Record the assistant turn so later tool results have context.
         self.history.lock().await.push(message.into_history_value());
 
-        Ok((TurnResult { text, tool_calls }, 0))
+        Ok((
+            TurnResult {
+                text,
+                tool_calls,
+                finish,
+            },
+            0,
+        ))
     }
 
     /// Record a text-only assistant reply. An empty one is skipped: strict
@@ -1034,6 +1081,8 @@ impl OpenAiBackend {
         let mut text = String::new();
         let mut tool_accum: Vec<StreamingToolCall> = Vec::new();
         let mut done = false;
+        // Arrives on a late chunk, usually one with an empty delta.
+        let mut finish = FinishReason::default();
         // Recovers a tool call the model wrote as literal `<tool_call>` text
         // instead of a structured delta. Scanning here (rather than after the
         // stream) keeps the tag off the UI: content goes straight to `sink` as
@@ -1084,6 +1133,9 @@ impl OpenAiBackend {
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
+                if let Some(reason) = choice.finish_reason.as_deref() {
+                    finish = FinishReason::from_wire(Some(reason));
+                }
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
@@ -1201,7 +1253,14 @@ impl OpenAiBackend {
                 .push(streamed_assistant_history(&text, &tool_calls));
         }
 
-        Ok((TurnResult { text, tool_calls }, malformed))
+        Ok((
+            TurnResult {
+                text,
+                tool_calls,
+                finish,
+            },
+            malformed,
+        ))
     }
 }
 
@@ -1566,6 +1625,8 @@ struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 struct CompletionChoice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1629,6 +1690,8 @@ struct StreamCompletion {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2150,12 +2213,20 @@ mod tests {
     fn spawn_message_stub(
         message: serde_json::Value,
     ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        spawn_choice_stub(serde_json::json!({ "message": message }))
+    }
+
+    /// Like [`spawn_message_stub`], answering with a whole choice, so a test
+    /// can set what sits beside the message.
+    fn spawn_choice_stub(
+        choice: serde_json::Value,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let body = serde_json::json!({ "choices": [{ "message": message }] }).to_string();
+        let body = serde_json::json!({ "choices": [choice] }).to_string();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             // Read until the full request (headers + content-length body) is in.
@@ -2196,6 +2267,41 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (addr, receiver)
+    }
+
+    #[test]
+    fn finish_reasons_map_from_the_wire() {
+        for reason in [None, Some("stop"), Some("tool_calls"), Some("unheard-of")] {
+            assert_eq!(FinishReason::from_wire(reason), FinishReason::Complete);
+        }
+        assert_eq!(
+            FinishReason::from_wire(Some("length")),
+            FinishReason::Length
+        );
+        assert_eq!(
+            FinishReason::from_wire(Some("content_filter")),
+            FinishReason::ContentFilter
+        );
+    }
+
+    /// The non-streaming path (headless runs, subagents) reads the reason off
+    /// the choice; a reply cut off at the token limit must not look finished.
+    #[tokio::test]
+    async fn a_truncated_json_reply_reports_length() {
+        let (addr, _requests) = spawn_choice_stub(serde_json::json!({
+            "message": { "role": "assistant", "content": "The answer is" },
+            "finish_reason": "length",
+        }));
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+
+        let result = backend
+            .send_message_with_tools("explain", &[], None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "The answer is");
+        assert_eq!(result.finish, FinishReason::Length);
     }
 
     /// A structured call can come back with a broken inline block in the same

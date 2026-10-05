@@ -282,6 +282,21 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> String {
 /// context window, so the cap can afford to be generous
 const MAX_TOOL_ROUNDS: usize = 24;
 
+/// The ACP stop reason for a turn that ran to its end (cancellation returns
+/// earlier). The round cap comes first: once it is hit the last round is a
+/// forced text reply, and whatever that round reports, the cap is why the
+/// turn stopped where it did.
+fn stop_reason_for(round_cap_reached: bool, finish: backend::FinishReason) -> StopReason {
+    if round_cap_reached {
+        return StopReason::MaxTurnRequests;
+    }
+    match finish {
+        backend::FinishReason::Complete => StopReason::EndTurn,
+        backend::FinishReason::Length => StopReason::MaxTokens,
+        backend::FinishReason::ContentFilter => StopReason::Refusal,
+    }
+}
+
 /// What the user sees when a turn that ran tools ends with no closing text.
 fn silent_stop_message(repeated_tool: Option<&str>, rounds: usize) -> String {
     match repeated_tool {
@@ -2371,6 +2386,15 @@ impl SiGitAgent {
         let mut reply = StreamedReply::default();
         let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
+        // Kept so a refused turn can be taken back out of history (see the end
+        // of this function). Only a remote endpoint reports a refusal, and an
+        // on-device snapshot would not survive the round trip intact anyway.
+        let history_before_turn = if backend.is_remote() {
+            Some(backend.history_snapshot().await)
+        } else {
+            None
+        };
+
         let mut result = match self
             .drain_turn(
                 cx,
@@ -2743,14 +2767,35 @@ impl SiGitAgent {
             .ok();
         }
 
+        let stop_reason = stop_reason_for(round >= MAX_TOOL_ROUNDS, result.finish);
+
+        // ACP defines a refusal as a turn the next prompt will not include:
+        // the client drops the user message and everything after it from its
+        // own view. Take the turn out of history too, or the model keeps
+        // answering a conversation the user can no longer see.
+        if stop_reason == StopReason::Refusal
+            && let Some(history) = history_before_turn
+        {
+            log::warn!(
+                "prompt({}) refused by the endpoint — dropping the turn from history",
+                session_id
+            );
+            backend.restore_history(history).await;
+        }
+
         // Persist the completed turn so a restart (or session/load) can pick
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
         self.persist_session(&session_id, &snapshot).await;
         self.finish_prompt(&session_id, &cancellation);
 
-        log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
-        Ok(PromptResponse::new(StopReason::EndTurn))
+        log::info!(
+            "prompt({}) complete — {} tool round(s), stop reason {:?}",
+            session_id,
+            round,
+            stop_reason
+        );
+        Ok(PromptResponse::new(stop_reason))
     }
 
     /// Ask the ACP client for permission to run one tool call. Presents
@@ -4868,6 +4913,32 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_reasons_follow_the_round_cap_then_the_finish_reason() {
+        use backend::FinishReason;
+
+        assert_eq!(
+            stop_reason_for(false, FinishReason::Complete),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason_for(false, FinishReason::Length),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            stop_reason_for(false, FinishReason::ContentFilter),
+            StopReason::Refusal
+        );
+        // The cap wins: the last round was a forced reply either way.
+        for finish in [
+            FinishReason::Complete,
+            FinishReason::Length,
+            FinishReason::ContentFilter,
+        ] {
+            assert_eq!(stop_reason_for(true, finish), StopReason::MaxTurnRequests);
+        }
+    }
 
     #[test]
     fn same_dir_matches_through_symlinks_and_survives_a_missing_directory() {

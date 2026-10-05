@@ -127,6 +127,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
   the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
   explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
+  `TurnResult::finish` carries the endpoint's `finish_reason` up to the loop, and
+  `stop_reason_for` in `main.rs` turns it into the ACP stop reason: the tool-round cap is
+  `max_turn_requests`, `length` is `max_tokens`, `content_filter` is `refusal`. ACP defines a
+  refusal as a turn the next prompt will not include, so `handle_prompt` restores the history
+  it snapshotted before the turn instead of only relabelling the response.
   Some models write tool calls into content as text; `src/inline_tool_calls.rs` recovers the
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call

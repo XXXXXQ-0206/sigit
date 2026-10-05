@@ -10,6 +10,13 @@
 
 ### Fixed
 
+- **A prompt turn now reports why it stopped.** ACP defines five stop reasons
+  and siGit Code only ever sent `end_turn` and `cancelled`. A turn that runs
+  into the tool-round cap now ends with `max_turn_requests`, a reply cut off
+  at the token limit with `max_tokens`, and a reply the endpoint withheld
+  (`content_filter`) with `refusal`. A refused turn is also taken out of the
+  conversation, which is what the protocol tells the client to expect (#140).
+
 - **A headless run no longer ends silently with no final message.** When the
   last round came back empty, which is what happens when a run is cut off at
   the tool-round cap mid-task, stdout was empty and the exit status was 0, so
