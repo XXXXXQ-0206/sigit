@@ -127,6 +127,16 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   endpoint can also fail *after* the response is open, reporting it as a `data:` frame holding
   the same envelope; that frame has no `choices`, so `consume_stream` has to check for it
   explicitly or it parses as an empty chunk and the turn ends looking like an empty answer.
+  `TurnResult::finish` carries the endpoint's `finish_reason` up to the loop, and
+  `stop_reason_for` in `main.rs` turns it into the ACP stop reason: the tool-round cap is
+  `max_turn_requests`, `length` is `max_tokens`, `content_filter` is `refusal`. ACP defines a
+  refusal as a turn the next prompt will not include, so `handle_prompt` restores the history
+  it snapshotted before the turn instead of only relabelling the response.
+  The round that reaches the cap (24, or `SIGIT_MAX_TOOL_ROUNDS`) is followed by one forced
+  text reply with no tools. The model cannot see that the tools are gone, so
+  `round_cap_note` is appended to that round's last tool result, and the turn always closes
+  with `round_cap_stop_message`. Without both, the thread stops on the model announcing a
+  step that never runs (issue #120).
   Some models write tool calls into content as text; `src/inline_tool_calls.rs` recovers the
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
@@ -243,7 +253,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   overrides and the default mode from `[permissions]` in `settings.toml` (`allow`/`ask`/`deny`,
   default `ask`; `SIGIT_PERMISSIONS` env overrides the default). On `ask`, the ACP path sends
   `session/request_permission` (allow once / allow for session / deny) and the TUI pauses the
-  inference task on a y/a/n prompt. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
+  inference task on a y/a/n prompt. On the ACP path the decision is taken *before* the call is
+  announced, because it sets the announced status: a call that will ask starts `pending`, the
+  permission request carries that call's own id, and an `in_progress` update follows approval.
+  That update also puts the card's title back, since the permission request overwrites it
+  with the full arguments. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
   serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
   answer mid-turn — don't move them back inline, and don't await client requests from inline
   handlers (deadlock).
@@ -337,7 +351,8 @@ verbosity with `RUST_LOG`.
 
 `OPENAI_BASE_URL` / `OPENAI_API_KEY` (provider override), `SIGIT_API_URL` (account API base,
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
-`SIGIT_MODEL`, `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+`SIGIT_MODEL`, `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
+headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
 smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),
