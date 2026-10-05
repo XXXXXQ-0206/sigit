@@ -458,6 +458,99 @@ fn permission_round_trip_cancel_then_allow() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A call that needs approval is one tool call from start to finish (issue
+/// #138). The permission request used to carry an id of its own, so a client
+/// drew an approval card next to a call that already claimed to be running.
+#[test]
+fn a_permission_request_is_about_the_tool_call_it_was_announced_as() {
+    let endpoint = start_fake_endpoint(vec![
+        sse_tool_call(
+            "call_1",
+            "run_command",
+            r#"{"command":"echo sigit-one-card"}"#,
+        ),
+        sse_text("done"),
+    ]);
+
+    let scratch = std::env::temp_dir().join(format!("sigit_acp_perm_id_{}", std::process::id()));
+    let config_dir = scratch.join("config");
+    let cwd = scratch.join("cwd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut agent = spawn_agent(endpoint.port, &config_dir);
+
+    let id = agent.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    agent.wait_for_response(id);
+
+    let id = agent.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
+    let session_id = agent.wait_for_response(id)["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let prompt_id = agent.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "run the command"}],
+        }),
+    );
+
+    // Messages arrive in order and `wait_for` drops what it skips, so each
+    // step below also checks that the one before it came first.
+    let call_update = |message: &Value, kind: &str| {
+        let update = &message["params"]["update"];
+        message["method"] == "session/update"
+            && update["sessionUpdate"] == kind
+            && update["toolCallId"] == "call_1"
+    };
+
+    let announced = agent.wait_for("the tool call announcement", |message| {
+        call_update(message, "tool_call")
+    });
+    // `pending` is the schema's default status, so it is left off the wire.
+    let status = &announced["params"]["update"]["status"];
+    assert!(
+        status.is_null() || status == "pending",
+        "a call waiting for approval has not started: {announced}"
+    );
+
+    let permission = agent.wait_for_agent_request("session/request_permission");
+    assert_eq!(
+        permission["params"]["toolCall"]["toolCallId"], "call_1",
+        "the request must name the announced call: {permission}"
+    );
+    agent.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}}),
+    );
+
+    let started = agent.wait_for("the approved call starting", |message| {
+        call_update(message, "tool_call_update")
+    });
+    let started = &started["params"]["update"];
+    assert_eq!(started["status"], "in_progress", "{started}");
+    assert_eq!(
+        started["title"], announced["params"]["update"]["title"],
+        "the card gets its own title back after the approval dialog: {started}"
+    );
+
+    let finished = agent.wait_for("the call finishing", |message| {
+        call_update(message, "tool_call_update")
+    });
+    assert_eq!(finished["params"]["update"]["status"], "completed");
+
+    let response = agent.wait_for_response(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn successful_config_option_changes_are_rendered_as_system_status_cards() {
     let endpoint = start_fake_endpoint(vec![]);

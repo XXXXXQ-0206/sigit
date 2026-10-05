@@ -76,8 +76,8 @@ use agent_client_protocol::schema::v1::{
     ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
+    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
     SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
@@ -89,8 +89,8 @@ use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder}
 use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
-    InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult, ToolSpec,
-    TurnResult,
+    ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult,
+    ToolSpec, TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -281,6 +281,42 @@ pub(crate) fn system_prompt_for_model(tool_calling: bool) -> String {
 /// (see [`backend::DEFAULT_CONTEXT_TOKEN_BUDGET`]) keeps long runs inside the
 /// context window, so the cap can afford to be generous
 const MAX_TOOL_ROUNDS: usize = 24;
+
+/// The ACP stop reason for a turn that ran to its end (cancellation returns
+/// earlier). The round cap comes first: once it is hit the last round is a
+/// forced text reply, and whatever that round reports, the cap is why the
+/// turn stopped where it did.
+fn stop_reason_for(round_cap_reached: bool, finish: backend::FinishReason) -> StopReason {
+    if round_cap_reached {
+        return StopReason::MaxTurnRequests;
+    }
+    match finish {
+        backend::FinishReason::Complete => StopReason::EndTurn,
+        backend::FinishReason::Length => StopReason::MaxTokens,
+        backend::FinishReason::ContentFilter => StopReason::Refusal,
+    }
+}
+
+/// What the user sees when a turn stops at the tool-round cap. Always sent,
+/// whatever the last round said: with no tools on offer that round tends to be
+/// the model announcing its next step ("Now commit:"), which reads as a stall
+/// when nothing follows it (issue #120).
+fn round_cap_stop_message(max_tool_rounds: usize) -> String {
+    format!(
+        "I stopped here because this turn used all {max_tool_rounds} of its tool rounds,          so the task may not be finished. Reply \"continue\" to pick it back up."
+    )
+}
+
+/// Appended to the last tool result of the round that reaches the cap. Without
+/// it the model has no way to know the tools are gone, so it spends its final
+/// reply saying what it is about to do instead of where things stand.
+fn round_cap_note(max_tool_rounds: usize) -> String {
+    format!(
+        "\n\n[siGit Code] That was tool round {max_tool_rounds} of {max_tool_rounds} for \
+         this turn, so no more tools can run until the user replies. Do not announce a next \
+         action. Say briefly what is done and what is left."
+    )
+}
 
 /// What the user sees when a turn that ran tools ends with no closing text.
 fn silent_stop_message(repeated_tool: Option<&str>, rounds: usize) -> String {
@@ -1476,6 +1512,76 @@ impl SiGitAgent {
     }
 }
 
+/// Session and model pairs already told that earlier images are hidden, so
+/// the note about a model switch is shown once and not on every prompt.
+static IMAGE_GAP_NOTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Decide what happens to a prompt's images for the model about to answer.
+///
+/// The editor can attach an image whatever model is selected, because ACP
+/// fixes `promptCapabilities.image` for the whole connection. Returns the text
+/// and images to send, plus a note for the user when something is being left
+/// out:
+///
+/// - the model cannot read images and the prompt has some: they are dropped,
+///   the user is told, and the model is told too, so it does not answer as if
+///   it had seen them;
+/// - the model cannot read images and the thread has some from before a model
+///   switch (`earlier_images`): the user is told once per session and model.
+fn images_for_turn(
+    mut user_text: String,
+    images: Vec<ImageInput>,
+    accepts_images: bool,
+    model_name: &str,
+    earlier_images: usize,
+    session_id: &str,
+) -> (String, Vec<ImageInput>, Option<String>) {
+    if accepts_images {
+        return (user_text, images, None);
+    }
+
+    const HINT: &str = "Models marked \"reads images\" in the model picker can.";
+    let plural = |count: usize| if count == 1 { "image" } else { "images" };
+
+    if !images.is_empty() {
+        let count = images.len();
+        if !user_text.is_empty() {
+            user_text.push_str("\n\n");
+        }
+        user_text.push_str(&format!(
+            "[The user attached {count} {}. This model cannot read images, so it was not \
+             included. Say so if the request depends on it.]",
+            plural(count)
+        ));
+        let notice = format!(
+            "> **Image not sent.** {model_name} cannot read images, so the {count} attached {} \
+             left out of this message. {HINT}",
+            if count == 1 {
+                "image was"
+            } else {
+                "images were"
+            }
+        );
+        return (user_text, Vec::new(), Some(notice));
+    }
+
+    if earlier_images > 0 {
+        let key = (session_id.to_string(), model_name.to_string());
+        let mut noted = IMAGE_GAP_NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(&key) {
+            noted.push(key);
+            let notice = format!(
+                "> **Earlier images are hidden.** {model_name} cannot read images, so the \
+                 {earlier_images} {} attached earlier in this thread {} not sent to it. {HINT}",
+                plural(earlier_images),
+                if earlier_images == 1 { "is" } else { "are" }
+            );
+            return (user_text, images, Some(notice));
+        }
+    }
+    (user_text, images, None)
+}
+
 /// The servers out of a session request's `mcpServers` that siGit Code can
 /// connect to.
 ///
@@ -1577,6 +1683,11 @@ impl SiGitAgent {
                 .agent_capabilities(
                     AgentCapabilities::default()
                         .load_session(true)
+                        // Lets the editor attach images to a prompt. The capability is fixed
+                        // for the connection while the model is not, so a prompt that
+                        // brings an image to a model that cannot read one is answered with
+                        // a note instead (see `images_for_turn`).
+                        .prompt_capabilities(PromptCapabilities::new().image(true))
                         // Clients only pass HTTP MCP servers in `mcpServers` to an
                         // agent that says it can reach them. SSE stays off: the
                         // MCP spec deprecated that transport.
@@ -2194,11 +2305,18 @@ impl SiGitAgent {
         }
 
         let mut parts: Vec<String> = Vec::new();
+        let mut images: Vec<ImageInput> = Vec::new();
 
         for block in &args.prompt {
             match block {
                 ContentBlock::Text(t) => {
                     parts.push(t.text.clone());
+                }
+                ContentBlock::Image(image) => {
+                    images.push(ImageInput {
+                        mime_type: image.mime_type.clone(),
+                        data: image.data.clone(),
+                    });
                 }
                 ContentBlock::Resource(embedded) => {
                     // editor inlined the file content already
@@ -2278,7 +2396,7 @@ impl SiGitAgent {
 
         let user_text = parts.join("\n");
 
-        if user_text.trim().is_empty() {
+        if user_text.trim().is_empty() && images.is_empty() {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
@@ -2358,9 +2476,38 @@ impl SiGitAgent {
 
         // ── tool-calling loop ────────────────────────────────────────────
         // send message → execute any tool calls → feed results back
-        // repeat up to MAX_TOOL_ROUNDS, then force a text reply
+        // repeat up to the tool-round cap, then force a text reply
 
         let tools = agent_tools_as_specs();
+        let max_tool_rounds = headless::max_tool_rounds_from_env();
+
+        let model_name = self.current_model.lock().unwrap().display_name.clone();
+        let earlier_images = if backend.accepts_images() {
+            0
+        } else {
+            backend
+                .history_snapshot()
+                .await
+                .iter()
+                .map(backend::message_image_count)
+                .sum()
+        };
+        let (user_text, images, notice) = images_for_turn(
+            user_text,
+            images,
+            backend.accepts_images(),
+            &model_name,
+            earlier_images,
+            &session_id.to_string(),
+        );
+        if let Some(notice) = notice {
+            self.send_assistant_message(
+                cx,
+                session_id.clone(),
+                format!("{notice}{PARAGRAPH_BREAK}"),
+            )
+            .ok();
+        }
 
         // Token sink: backends stream assistant text through this while a turn
         // runs. We forward the visible portion to the editor as agent-message
@@ -2371,11 +2518,20 @@ impl SiGitAgent {
         let mut reply = StreamedReply::default();
         let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
+        // Kept so a refused turn can be taken back out of history (see the end
+        // of this function). Only a remote endpoint reports a refusal, and an
+        // on-device snapshot would not survive the round trip intact anyway.
+        let history_before_turn = if backend.is_remote() {
+            Some(backend.history_snapshot().await)
+        } else {
+            None
+        };
+
         let mut result = match self
             .drain_turn(
                 cx,
                 &session_id,
-                backend.send_message_with_tools(&user_text, &tools, Some(&sink)),
+                backend.send_message_with_images(&user_text, &images, &tools, Some(&sink)),
                 &mut sink_rx,
                 &mut reply,
                 &cancellation,
@@ -2411,7 +2567,7 @@ impl SiGitAgent {
         // end of the turn can tell whether that round said anything at all.
         let mut sent_before_last_round = 0;
 
-        while !result.tool_calls.is_empty() && round < MAX_TOOL_ROUNDS {
+        while !result.tool_calls.is_empty() && round < max_tool_rounds {
             if cancellation.cancelled.load(Ordering::Acquire) {
                 self.finish_prompt(&session_id, &cancellation);
                 return Ok(PromptResponse::new(StopReason::Cancelled));
@@ -2470,6 +2626,39 @@ impl SiGitAgent {
                     tc.arguments.chars().take(120).collect::<String>()
                 );
 
+                let signature = format!("{}\n{}", tc.name, tc.arguments);
+                let repeat_count = repeated_tool_calls
+                    .entry(signature)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                // Repeated status checks are expected for a live background
+                // command. command_output long-polls and the overall round cap
+                // still bounds a confused model without cutting off a real
+                // build or release while it is in progress.
+                let repeated = *repeat_count >= 3 && tc.name != "command_output";
+                if repeated {
+                    force_text = true;
+                    stopped_repeating = Some(tc.name.clone());
+                    log::warn!(
+                        "prompt({}) stopping repeated tool call `{}` after {} attempts",
+                        session_id,
+                        tc.name,
+                        repeat_count
+                    );
+                }
+
+                // Decided before the call is announced, because the answer sets
+                // the status it is announced with: a call that has to wait for
+                // the user starts out `pending`, everything else is already
+                // running. A repeated call is never run, so never asked about.
+                let decision = (!repeated).then(|| {
+                    permissions::decision_for(&session_id.to_string(), &tc.name, &tc.arguments)
+                });
+                let announced_status = match decision {
+                    Some(permissions::Decision::Ask) => ToolCallStatus::Pending,
+                    _ => ToolCallStatus::InProgress,
+                };
+
                 // Only treat the call as a plan once its arguments have actually
                 // produced one. Keying off the tool name alone means a
                 // `write_todos` the converter rejects sends no plan *and* skips
@@ -2501,7 +2690,7 @@ impl SiGitAgent {
                         SessionUpdate::ToolCall(
                             ToolCall::new(tc.id.clone(), chat::tool_title(&tc.name, &tc.arguments))
                                 .kind(tool_kind_for(&tc.name))
-                                .status(ToolCallStatus::InProgress)
+                                .status(announced_status)
                                 .content(vec![invocation_content])
                                 .locations(tool_call_locations(&tc.name, &tc.arguments))
                                 .raw_input(raw_input),
@@ -2510,41 +2699,15 @@ impl SiGitAgent {
                     .ok();
                 }
 
-                let signature = format!("{}\n{}", tc.name, tc.arguments);
-                let repeat_count = repeated_tool_calls
-                    .entry(signature)
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-                // Repeated status checks are expected for a live background
-                // command. command_output long-polls and the overall round cap
-                // still bounds a confused model without cutting off a real
-                // build or release while it is in progress.
-                let repeated = *repeat_count >= 3 && tc.name != "command_output";
-                if repeated {
-                    force_text = true;
-                    stopped_repeating = Some(tc.name.clone());
-                    log::warn!(
-                        "prompt({}) stopping repeated tool call `{}` after {} attempts",
-                        session_id,
-                        tc.name,
-                        repeat_count
-                    );
-                }
-
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
-                let output = if repeated {
-                    format!(
+                let output = match decision {
+                    None => format!(
                         "The tool `{}` was not executed again because the model repeated \
                          the same call three times. Continue without this tool.",
                         tc.name
-                    )
-                } else {
-                    match permissions::decision_for(
-                        &session_id.to_string(),
-                        &tc.name,
-                        &tc.arguments,
-                    ) {
+                    ),
+                    Some(decision) => match decision {
                         permissions::Decision::Allow => {
                             tools::execute_tool(&tc.name, &tc.arguments).await
                         }
@@ -2554,10 +2717,36 @@ impl SiGitAgent {
                         }
                         permissions::Decision::Ask => {
                             match self
-                                .request_tool_permission(cx, &session_id, &tc.name, &tc.arguments)
+                                .request_tool_permission(
+                                    cx,
+                                    &session_id,
+                                    &tc.id,
+                                    &tc.name,
+                                    &tc.arguments,
+                                )
                                 .await
                             {
                                 PermissionVerdict::Approved => {
+                                    // The call the user just approved leaves
+                                    // `pending` here. The title goes back to
+                                    // the card's own: the permission request
+                                    // replaced it with the full arguments.
+                                    if !render_as_plan {
+                                        self.send_tool_call_update(
+                                            cx,
+                                            session_id.clone(),
+                                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                                tc.id.clone(),
+                                                ToolCallUpdateFields::new()
+                                                    .status(ToolCallStatus::InProgress)
+                                                    .title(chat::tool_title(
+                                                        &tc.name,
+                                                        &tc.arguments,
+                                                    )),
+                                            )),
+                                        )
+                                        .ok();
+                                    }
                                     tools::execute_tool(&tc.name, &tc.arguments).await
                                 }
                                 PermissionVerdict::Denied(reason) => {
@@ -2608,7 +2797,7 @@ impl SiGitAgent {
                                 }
                             }
                         }
-                    }
+                    },
                 };
 
                 log::info!("  ← {} chars", output.len());
@@ -2651,7 +2840,11 @@ impl SiGitAgent {
                 }
             }
 
-            let allow_tool_calls = round < MAX_TOOL_ROUNDS && !force_text;
+            let round_cap_reached = round >= max_tool_rounds;
+            let allow_tool_calls = !round_cap_reached && !force_text;
+            if round_cap_reached && let Some(last) = tool_results.last_mut() {
+                last.content.push_str(&round_cap_note(max_tool_rounds));
+            }
 
             // Whatever this round says starts a new paragraph rather than
             // continuing the sentence the tool calls interrupted.
@@ -2695,10 +2888,14 @@ impl SiGitAgent {
         // If anything streamed, the visible reply is already on the wire; only
         // send a trailing block for the non-streamed path (e.g. on-device direct
         // answers, which onde can't stream while tools are on offer).
+        let round_cap_reached = round >= max_tool_rounds;
         if !reply.streamed_any {
             let reply_text = result.text.trim().to_string();
             let final_text = if reply_text.is_empty() {
-                if round > 0 {
+                if round_cap_reached {
+                    // The cap notice below covers it.
+                    String::new()
+                } else if round > 0 {
                     log::warn!(
                         "prompt({}) — model returned empty reply after {} tool round(s)",
                         session_id,
@@ -2722,7 +2919,7 @@ impl SiGitAgent {
                 self.send_assistant_message(cx, session_id.clone(), final_text)
                     .ok();
             }
-        } else if round > 0 && reply.sent.len() == sent_before_last_round {
+        } else if round > 0 && !round_cap_reached && reply.sent.len() == sent_before_last_round {
             // Earlier rounds streamed text, but the last one (typically the
             // forced no-tools round) said nothing. Without a closing message
             // the turn just stops, and the user can't tell whether it ended,
@@ -2743,17 +2940,57 @@ impl SiGitAgent {
             .ok();
         }
 
+        if round_cap_reached {
+            log::warn!(
+                "prompt({}) stopped at the cap of {} tool round(s)",
+                session_id,
+                max_tool_rounds
+            );
+            self.send_assistant_message(
+                cx,
+                session_id.clone(),
+                format!(
+                    "{PARAGRAPH_BREAK}{}",
+                    round_cap_stop_message(max_tool_rounds)
+                ),
+            )
+            .ok();
+        }
+
+        let stop_reason = stop_reason_for(round_cap_reached, result.finish);
+
+        // ACP defines a refusal as a turn the next prompt will not include:
+        // the client drops the user message and everything after it from its
+        // own view. Take the turn out of history too, or the model keeps
+        // answering a conversation the user can no longer see.
+        if stop_reason == StopReason::Refusal
+            && let Some(history) = history_before_turn
+        {
+            log::warn!(
+                "prompt({}) refused by the endpoint — dropping the turn from history",
+                session_id
+            );
+            backend.restore_history(history).await;
+        }
+
         // Persist the completed turn so a restart (or session/load) can pick
         // the conversation back up.
         let snapshot = backend.history_snapshot().await;
         self.persist_session(&session_id, &snapshot).await;
         self.finish_prompt(&session_id, &cancellation);
 
-        log::info!("prompt({}) complete — {} tool round(s)", session_id, round);
-        Ok(PromptResponse::new(StopReason::EndTurn))
+        log::info!(
+            "prompt({}) complete — {} tool round(s), stop reason {:?}",
+            session_id,
+            round,
+            stop_reason
+        );
+        Ok(PromptResponse::new(stop_reason))
     }
 
-    /// Ask the ACP client for permission to run one tool call. Presents
+    /// Ask the ACP client for permission to run one tool call. The request
+    /// names the call by `tool_call_id`, the id it was announced under, so the
+    /// client updates that one card instead of drawing a second. Presents
     /// allow-once / allow-for-session / deny; an "always allow" choice is
     /// recorded via [`permissions::grant_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
@@ -2762,6 +2999,7 @@ impl SiGitAgent {
         &self,
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
+        tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
     ) -> PermissionVerdict {
@@ -2783,7 +3021,7 @@ impl SiGitAgent {
         let request = RequestPermissionRequest::new(
             session_id.clone(),
             ToolCallUpdate::new(
-                format!("perm-{}", uuid::Uuid::new_v4()),
+                tool_call_id.to_string(),
                 ToolCallUpdateFields::new()
                     .title(title)
                     .kind(tool_kind_for(tool_name))
@@ -3493,6 +3731,16 @@ fn build_config_options(
             }
             if item.tool_calling {
                 desc_parts.push("tool calling".to_string());
+            }
+            // The editor offers image attachments for every model, because
+            // the capability is per connection. This is where the user can see
+            // which models will actually look at one.
+            if item
+                .cloud_tier
+                .as_deref()
+                .is_some_and(provider::tier_accepts_images)
+            {
+                desc_parts.push("reads images".to_string());
             }
             desc_parts.push(format!(
                 "{} context",
@@ -4870,6 +5118,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_reasons_follow_the_round_cap_then_the_finish_reason() {
+        use backend::FinishReason;
+
+        assert_eq!(
+            stop_reason_for(false, FinishReason::Complete),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            stop_reason_for(false, FinishReason::Length),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            stop_reason_for(false, FinishReason::ContentFilter),
+            StopReason::Refusal
+        );
+        // The cap wins: the last round was a forced reply either way.
+        for finish in [
+            FinishReason::Complete,
+            FinishReason::Length,
+            FinishReason::ContentFilter,
+        ] {
+            assert_eq!(stop_reason_for(true, finish), StopReason::MaxTurnRequests);
+        }
+    }
+
+    #[test]
     fn same_dir_matches_through_symlinks_and_survives_a_missing_directory() {
         let root = std::env::temp_dir().join(format!("sigit_same_dir_{}", std::process::id()));
         let real = root.join("real");
@@ -5610,6 +5884,52 @@ mod tests {
     fn longest_backtick_run_finds_the_widest_run() {
         assert_eq!(longest_backtick_run("no backticks here"), 0);
         assert_eq!(longest_backtick_run("one ` two `` three ``` four"), 3);
+    }
+
+    fn png() -> ImageInput {
+        ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        }
+    }
+
+    #[test]
+    fn images_go_through_untouched_to_a_model_that_reads_them() {
+        let (text, images, notice) =
+            images_for_turn("look".to_string(), vec![png()], true, "Large", 3, "s-pass");
+        assert_eq!(text, "look");
+        assert_eq!(images.len(), 1);
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn a_text_only_model_gets_a_note_and_the_user_is_told() {
+        let (text, images, notice) =
+            images_for_turn("look".to_string(), vec![png()], false, "Nova", 0, "s-drop");
+        assert!(images.is_empty());
+        assert!(
+            text.starts_with("look\n\n[The user attached 1 image."),
+            "{text}"
+        );
+        let notice = notice.expect("the user must be told the image was left out");
+        assert!(notice.contains("Nova cannot read images"), "{notice}");
+        assert!(notice.contains("reads images"), "{notice}");
+    }
+
+    #[test]
+    fn switching_to_a_text_only_model_is_flagged_once() {
+        let turn = || images_for_turn("next".to_string(), Vec::new(), false, "Nova", 2, "s-switch");
+
+        let (text, _, notice) = turn();
+        assert_eq!(text, "next", "nothing is added to a prompt with no image");
+        let notice = notice.expect("earlier images going out of view must be flagged");
+        assert!(notice.contains("2 images attached earlier"), "{notice}");
+
+        let (_, _, again) = turn();
+        assert!(
+            again.is_none(),
+            "the note is shown once, not on every prompt"
+        );
     }
 
     #[test]

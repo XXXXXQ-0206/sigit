@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.6.1
+
+### Added
+
+- **Images can be attached to a prompt in the editor.** siGit Code now
+  advertises `promptCapabilities.image`, so an ACP client offers image
+  attachments. The image goes to the model when the active model reads images.
+  The model picker marks those models with "reads images". The on-device
+  models and four cloud tiers (`nova`, `orbit`, `apex`, `flux`) are text-only:
+  with one of them active the image is left out, a note in the thread says so,
+  and the model is told an image was withheld. Switching a thread that already
+  holds images to a text-only model flags that once as well. Cloud tiers need
+  siGit Code Cloud to accept image parts, which is rolling out separately
+  (#134).
+
+- **The tool-round cap of a headless run can be set.** `--max-tool-rounds <n>`
+  or `SIGIT_MAX_TOOL_ROUNDS` (1 to 500) replaces the built-in 24 for
+  `sigit run` and `sigit -p`. The flag wins over the variable.
+
+### Fixed
+
+- **A prompt turn now reports why it stopped.** ACP defines five stop reasons
+  and siGit Code only ever sent `end_turn` and `cancelled`. A turn that runs
+  into the tool-round cap now ends with `max_turn_requests`, a reply cut off
+  at the token limit with `max_tokens`, and a reply the endpoint withheld
+  (`content_filter`) with `refusal`. A refused turn is also taken out of the
+  conversation, which is what the protocol tells the client to expect (#140).
+
+- **A tool call that needs approval is one card, not two.** The permission
+  request carried an id of its own, so an ACP client showed an approval card
+  beside a call that already claimed to be running. The call is now announced
+  as `pending`, the permission request names that same call, and it moves to
+  `in_progress` once approved. Calls allowed by policy still start out
+  `in_progress` (#138).
+
+- **A turn that runs out of tool rounds says so.** In an editor, a long task
+  could stop on a line like "Now commit:" with nothing after it. The turn had
+  used all 24 tool rounds, the model spent its last reply announcing the next
+  step, and the call behind it was dropped. siGit Code now tells the model
+  that its rounds are used up before that last reply, and ends the turn with a
+  message saying why it stopped and that "continue" picks it back up.
+  `SIGIT_MAX_TOOL_ROUNDS` now sets the cap for editor sessions too (#120).
+
+- **A headless run no longer ends silently with no final message.** When the
+  last round came back empty, which is what happens when a run is cut off at
+  the tool-round cap mid-task, stdout was empty and the exit status was 0, so
+  a caller could not tell it from a run with nothing to report. siGit Code now
+  asks the model once for its final message before finishing.
+
 ## 1.6.0
 
 ### Added

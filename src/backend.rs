@@ -58,6 +58,36 @@ pub struct ToolResult {
 pub struct TurnResult {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Why the model stopped. Only the last round of a turn decides how the
+    /// turn is reported; a round that goes on to run tools is not the end.
+    pub finish: FinishReason,
+}
+
+/// Why the model stopped generating, reduced to what the agent loop acts on.
+/// Endpoints report it as `finish_reason`; without it a reply cut off at the
+/// token limit is indistinguishable from one the model finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FinishReason {
+    /// The model finished on its own: `stop`, `tool_calls`, or no reason given.
+    #[default]
+    Complete,
+    /// The output ran into the token limit, so the reply is cut short.
+    Length,
+    /// The endpoint withheld the reply instead of answering.
+    ContentFilter,
+}
+
+impl FinishReason {
+    /// Map a wire `finish_reason`. OpenAI's spellings are `length` and
+    /// `content_filter`; gateways in front of other providers sometimes pass
+    /// the upstream's own word through, so those are accepted too.
+    fn from_wire(reason: Option<&str>) -> Self {
+        match reason {
+            Some("length" | "max_tokens") => Self::Length,
+            Some("content_filter" | "refusal") => Self::ContentFilter,
+            _ => Self::Complete,
+        }
+    }
 }
 
 /// Backend errors are plain strings. Callers map them to ACP errors.
@@ -199,10 +229,15 @@ fn transcript_for_summary(history: &[serde_json::Value]) -> String {
         }
 
         let mut parts: Vec<String> = Vec::new();
-        if let Some(text) = message["content"].as_str()
-            && !text.trim().is_empty()
-        {
-            parts.push(text.to_string());
+        let text = message_text(message);
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+        // A summary cannot carry a picture, but it should say one was there.
+        match message_image_count(message) {
+            0 => {}
+            1 => parts.push("[attached an image]".to_string()),
+            count => parts.push(format!("[attached {count} images]")),
         }
         for call in message["tool_calls"].as_array().into_iter().flatten() {
             parts.push(format!(
@@ -225,11 +260,54 @@ fn transcript_for_summary(history: &[serde_json::Value]) -> String {
 /// Deliberately model-agnostic — it only needs to be in the right ballpark to
 /// decide when compaction is worth an extra inference round.
 pub fn estimate_tokens(history: &[serde_json::Value]) -> usize {
-    let chars: usize = history
-        .iter()
-        .map(|message| message.to_string().chars().count())
-        .sum();
-    chars / 4
+    let mut chars = 0;
+    let mut images = 0;
+    for message in history {
+        let image_count = message_image_count(message);
+        if image_count == 0 {
+            chars += message.to_string().chars().count();
+        } else {
+            // An image travels as base64, megabytes of it, but a model bills
+            // it by resolution. Counting the payload as text would put every
+            // session with one screenshot permanently over budget.
+            chars += message_text(message).chars().count();
+            images += image_count;
+        }
+    }
+    chars / 4 + images * IMAGE_TOKEN_ESTIMATE
+}
+
+/// What one attached image is assumed to cost. Providers land between a few
+/// hundred and a couple of thousand tokens depending on resolution; like the
+/// rest of [`estimate_tokens`] this only has to be in the right ballpark.
+const IMAGE_TOKEN_ESTIMATE: usize = 1_000;
+
+/// The text of a history message. `content` is a plain string for almost every
+/// message; a user message that carries an image uses OpenAI's content-part
+/// array instead, and its text parts are joined here.
+pub fn message_text(message: &serde_json::Value) -> String {
+    match &message["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// How many images a history message carries as `image_url` content parts.
+pub fn message_image_count(message: &serde_json::Value) -> usize {
+    message["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "image_url")
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// A sink for streaming assistant text deltas to the UI as they are produced.
@@ -240,6 +318,67 @@ pub fn estimate_tokens(history: &[serde_json::Value]) -> usize {
 /// `None`, the backend runs in non-streaming mode. Unbounded so the inference
 /// task never blocks on a slow consumer.
 pub type TokenSink = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// An image attached to a user message: base64 data and its media type, as an
+/// ACP client sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInput {
+    pub mime_type: String,
+    pub data: String,
+}
+
+/// What a model that cannot read images is shown in place of one.
+const IMAGE_OMITTED_NOTE: &str = "[image omitted: this model cannot read images]";
+
+/// A user message in history form. Plain text keeps the string `content` every
+/// other message uses; with images it becomes OpenAI's content-part array,
+/// text first, each image as a base64 `data:` URL.
+fn user_message(text: &str, images: &[ImageInput]) -> serde_json::Value {
+    if images.is_empty() {
+        return serde_json::json!({ "role": "user", "content": text });
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime_type, image.data),
+            },
+        }));
+    }
+    serde_json::json!({ "role": "user", "content": parts })
+}
+
+/// `history` as a text-only model has to receive it: a message that carries
+/// images is flattened back to a string, with a note where each image was.
+///
+/// History itself keeps the images. A thread can move to a model that reads
+/// them (or back to one), so what was attached is not thrown away just because
+/// the model active right now cannot use it.
+fn without_images(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .map(|message| {
+            let images = message_image_count(message);
+            if images == 0 {
+                return message.clone();
+            }
+            let mut text = message_text(message);
+            for _ in 0..images {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(IMAGE_OMITTED_NOTE);
+            }
+            let mut flattened = message.clone();
+            flattened["content"] = serde_json::Value::String(text);
+            flattened
+        })
+        .collect()
+}
 
 // ── The trait ───────────────────────────────────────────────────────────────────
 
@@ -278,6 +417,28 @@ pub trait InferenceBackend: Send + Sync {
     /// unanswered makes strict OpenAI-compatible endpoints reject every later
     /// request in the session.
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>);
+
+    /// Start a turn from a user message that carries images.
+    ///
+    /// The default drops the images and sends the text, which is right for a
+    /// backend that cannot read them. Callers check [`Self::accepts_images`]
+    /// first so the user can be told, instead of the image vanishing.
+    async fn send_message_with_images(
+        &self,
+        text: &str,
+        images: &[ImageInput],
+        tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
+    ) -> Result<TurnResult, BackendError> {
+        let _ = images;
+        self.send_message_with_tools(text, tools, sink).await
+    }
+
+    /// Whether the model behind this backend reads images. On-device models do
+    /// not; a remote one answers from its model id.
+    fn accepts_images(&self) -> bool {
+        false
+    }
 
     /// Whether inference runs over the network (a configured provider) rather
     /// than on-device. Drives UI labelling so the displayed model can't claim a
@@ -341,7 +502,9 @@ impl LocalBackend {
         self.engine.clear_history().await;
         for entry in history {
             let role = entry["role"].as_str().unwrap_or("");
-            let content = entry["content"].as_str().unwrap_or("").to_string();
+            // The on-device engine keeps text only, so an image attached
+            // while a cloud model was active stays behind here.
+            let content = message_text(&entry);
             // Tool-call-only assistant entries and empty tool results carry no
             // text a plain chat history can replay; drop them.
             if content.is_empty() && role != "user" && role != "system" {
@@ -603,6 +766,7 @@ async fn drain_onde_stream(
     sink: &TokenSink,
 ) -> Result<TurnResult, BackendError> {
     let mut text = String::new();
+    let mut finish = FinishReason::default();
     while let Some(chunk) = rx.recv().await {
         if !chunk.delta.is_empty() {
             text.push_str(&chunk.delta);
@@ -613,23 +777,26 @@ async fn drain_onde_stream(
             }
         }
         if chunk.done {
-            if let Some(reason) = chunk.finish_reason
+            if let Some(reason) = chunk.finish_reason.as_deref()
                 && let Some(message) = reason.strip_prefix("error: ")
             {
                 return Err(message.to_string());
             }
+            finish = FinishReason::from_wire(chunk.finish_reason.as_deref());
             break;
         }
     }
     Ok(TurnResult {
         text,
         tool_calls: Vec::new(),
+        finish,
     })
 }
 
 /// Convert an `onde` tool-aware result into the neutral [`TurnResult`].
 fn onde_result_to_turn(result: onde::inference::ToolAwareResult) -> TurnResult {
     TurnResult {
+        finish: FinishReason::from_wire(Some(&result.finish_reason)),
         text: result.text,
         tool_calls: result
             .tool_calls
@@ -657,6 +824,10 @@ pub struct OpenAiBackend {
     http: reqwest::Client,
     /// The full message list sent on each request (system + turns + tool results).
     history: Mutex<Vec<serde_json::Value>>,
+    /// Whether `model` reads images (see `provider::model_accepts_images`).
+    /// When it does not, images already in `history` are left out of each
+    /// request rather than sent to an endpoint that would refuse them.
+    accepts_images: bool,
 }
 
 impl OpenAiBackend {
@@ -673,10 +844,12 @@ impl OpenAiBackend {
         if let Some(prompt) = system_prompt {
             history.push(serde_json::json!({ "role": "system", "content": prompt }));
         }
+        let model = model.into();
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
-            model: model.into(),
+            accepts_images: crate::provider::model_accepts_images(&model),
+            model,
             http: reqwest::Client::new(),
             history: Mutex::new(history),
         }
@@ -747,6 +920,7 @@ impl OpenAiBackend {
         Ok(TurnResult {
             text: join_reply_text(&result.text, &retry.text),
             tool_calls: retry.tool_calls,
+            finish: retry.finish,
         })
     }
 
@@ -761,9 +935,17 @@ impl OpenAiBackend {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let streaming = sink.is_some();
 
+        let messages = {
+            let history = self.history.lock().await;
+            if self.accepts_images {
+                history.clone()
+            } else {
+                without_images(&history)
+            }
+        };
         let mut body = serde_json::json!({
             "model": self.model,
-            "messages": *self.history.lock().await,
+            "messages": messages,
             "stream": streaming,
         });
         if allow_tool_calls && !tools.is_empty() {
@@ -865,12 +1047,13 @@ impl OpenAiBackend {
             .await
             .map_err(|error| format!("response parse error: {error}"))?;
 
-        let message = parsed
+        let choice = parsed
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
             .ok_or_else(|| "endpoint returned no choices".to_string())?;
+        let finish = FinishReason::from_wire(choice.finish_reason.as_deref());
+        let message = choice.message;
 
         let mut text = message.content.clone().unwrap_or_default();
         let mut tool_calls: Vec<ToolCall> = message
@@ -913,6 +1096,7 @@ impl OpenAiBackend {
                 TurnResult {
                     text,
                     tool_calls: Vec::new(),
+                    finish,
                 },
                 malformed,
             ));
@@ -951,6 +1135,7 @@ impl OpenAiBackend {
                     TurnResult {
                         text: cleaned,
                         tool_calls,
+                        finish,
                     },
                     malformed,
                 ));
@@ -963,6 +1148,7 @@ impl OpenAiBackend {
                     TurnResult {
                         text: cleaned,
                         tool_calls,
+                        finish,
                     },
                     malformed,
                 ));
@@ -992,6 +1178,7 @@ impl OpenAiBackend {
                 TurnResult {
                     text: extracted.text,
                     tool_calls,
+                    finish,
                 },
                 malformed,
             ));
@@ -1000,7 +1187,14 @@ impl OpenAiBackend {
         // Record the assistant turn so later tool results have context.
         self.history.lock().await.push(message.into_history_value());
 
-        Ok((TurnResult { text, tool_calls }, 0))
+        Ok((
+            TurnResult {
+                text,
+                tool_calls,
+                finish,
+            },
+            0,
+        ))
     }
 
     /// Record a text-only assistant reply. An empty one is skipped: strict
@@ -1034,6 +1228,8 @@ impl OpenAiBackend {
         let mut text = String::new();
         let mut tool_accum: Vec<StreamingToolCall> = Vec::new();
         let mut done = false;
+        // Arrives on a late chunk, usually one with an empty delta.
+        let mut finish = FinishReason::default();
         // Recovers a tool call the model wrote as literal `<tool_call>` text
         // instead of a structured delta. Scanning here (rather than after the
         // stream) keeps the tag off the UI: content goes straight to `sink` as
@@ -1084,6 +1280,9 @@ impl OpenAiBackend {
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
+                if let Some(reason) = choice.finish_reason.as_deref() {
+                    finish = FinishReason::from_wire(Some(reason));
+                }
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
@@ -1201,7 +1400,14 @@ impl OpenAiBackend {
                 .push(streamed_assistant_history(&text, &tool_calls));
         }
 
-        Ok((TurnResult { text, tool_calls }, malformed))
+        Ok((
+            TurnResult {
+                text,
+                tool_calls,
+                finish,
+            },
+            malformed,
+        ))
     }
 }
 
@@ -1327,6 +1533,21 @@ impl InferenceBackend for OpenAiBackend {
                 "content": result.content,
             }));
         }
+    }
+
+    async fn send_message_with_images(
+        &self,
+        text: &str,
+        images: &[ImageInput],
+        tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
+    ) -> Result<TurnResult, BackendError> {
+        self.history.lock().await.push(user_message(text, images));
+        self.complete(tools, true, sink).await
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.accepts_images
     }
 
     fn is_remote(&self) -> bool {
@@ -1566,6 +1787,8 @@ struct ChatCompletion {
 #[derive(Debug, Deserialize)]
 struct CompletionChoice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1629,6 +1852,8 @@ struct StreamCompletion {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1695,7 +1920,7 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
                         if let Some(object) = message.as_object_mut() {
                             object.remove("tool_calls");
                         }
-                        if message["content"].as_str().unwrap_or_default().is_empty() {
+                        if message_text(&message).is_empty() {
                             continue;
                         }
                     } else {
@@ -2052,6 +2277,118 @@ mod tests {
         assert_eq!(history[0]["content"], "new prompt");
     }
 
+    fn user_with_image(text: &str, payload_chars: usize) -> serde_json::Value {
+        serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": text },
+                { "type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{}", "A".repeat(payload_chars)),
+                }},
+            ],
+        })
+    }
+
+    #[test]
+    fn user_message_uses_content_parts_only_when_there_is_an_image() {
+        assert_eq!(
+            user_message("hello", &[]),
+            serde_json::json!({ "role": "user", "content": "hello" })
+        );
+
+        let image = ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        };
+        assert_eq!(
+            user_message("what is this?", std::slice::from_ref(&image)),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                ],
+            })
+        );
+        // An image with no text sends no empty text part.
+        let only_image = user_message("", &[image]);
+        assert_eq!(only_image["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_text_only_model_is_sent_a_note_in_place_of_each_image() {
+        let history = vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            user_with_image("what is this?", 16),
+            serde_json::json!({ "role": "assistant", "content": "a cat" }),
+        ];
+        let sent = without_images(&history);
+
+        assert_eq!(sent[0], history[0]);
+        assert_eq!(sent[2], history[2]);
+        assert_eq!(
+            sent[1]["content"],
+            format!("what is this?\n{IMAGE_OMITTED_NOTE}")
+        );
+        // History keeps the image for a model that can read it later.
+        assert_eq!(message_image_count(&history[1]), 1);
+    }
+
+    #[test]
+    fn a_remote_backend_reads_images_by_model_id() {
+        let own_endpoint = OpenAiBackend::new("http://localhost", "", "gpt-4o-mini", None);
+        assert!(own_endpoint.accepts_images());
+        let text_tier = OpenAiBackend::new("http://localhost", "", "onde-nova", None);
+        assert!(!text_tier.accepts_images());
+        let image_tier = OpenAiBackend::new("http://localhost", "", "onde-large", None);
+        assert!(image_tier.accepts_images());
+    }
+
+    #[test]
+    fn message_text_reads_both_content_shapes() {
+        assert_eq!(
+            message_text(&serde_json::json!({ "role": "user", "content": "hello" })),
+            "hello"
+        );
+        let with_image = user_with_image("what is this?", 16);
+        assert_eq!(message_text(&with_image), "what is this?");
+        assert_eq!(message_image_count(&with_image), 1);
+        // A tool-call-only assistant message has no content at all.
+        let no_content = serde_json::json!({ "role": "assistant", "content": null });
+        assert_eq!(message_text(&no_content), "");
+        assert_eq!(message_image_count(&no_content), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_does_not_count_an_image_payload_as_text() {
+        // Two megabytes of base64 would read as half a million tokens.
+        let history = vec![user_with_image("what is this?", 2_000_000)];
+        let estimate = estimate_tokens(&history);
+        assert!(
+            (IMAGE_TOKEN_ESTIMATE..IMAGE_TOKEN_ESTIMATE + 100).contains(&estimate),
+            "{estimate}"
+        );
+    }
+
+    #[test]
+    fn summary_transcript_keeps_the_text_of_a_message_with_an_image() {
+        let transcript = transcript_for_summary(&[user_with_image("what is this?", 64)]);
+        assert!(transcript.contains("what is this?"), "{transcript}");
+        assert!(transcript.contains("[attached an image]"), "{transcript}");
+        assert!(!transcript.contains("base64"), "{transcript}");
+    }
+
+    #[test]
+    fn carryover_keeps_a_user_message_that_carries_an_image() {
+        let carried = carryover_history(vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            user_with_image("what is this?", 16),
+            serde_json::json!({ "role": "assistant", "content": "a cat" }),
+        ]);
+        assert_eq!(carried.len(), 2);
+        assert_eq!(message_image_count(&carried[0]), 1);
+    }
+
     #[test]
     fn estimate_tokens_scales_with_serialized_size() {
         assert_eq!(estimate_tokens(&[]), 0);
@@ -2150,12 +2487,20 @@ mod tests {
     fn spawn_message_stub(
         message: serde_json::Value,
     ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        spawn_choice_stub(serde_json::json!({ "message": message }))
+    }
+
+    /// Like [`spawn_message_stub`], answering with a whole choice, so a test
+    /// can set what sits beside the message.
+    fn spawn_choice_stub(
+        choice: serde_json::Value,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let body = serde_json::json!({ "choices": [{ "message": message }] }).to_string();
+        let body = serde_json::json!({ "choices": [choice] }).to_string();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             // Read until the full request (headers + content-length body) is in.
@@ -2196,6 +2541,41 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (addr, receiver)
+    }
+
+    #[test]
+    fn finish_reasons_map_from_the_wire() {
+        for reason in [None, Some("stop"), Some("tool_calls"), Some("unheard-of")] {
+            assert_eq!(FinishReason::from_wire(reason), FinishReason::Complete);
+        }
+        assert_eq!(
+            FinishReason::from_wire(Some("length")),
+            FinishReason::Length
+        );
+        assert_eq!(
+            FinishReason::from_wire(Some("content_filter")),
+            FinishReason::ContentFilter
+        );
+    }
+
+    /// The non-streaming path (headless runs, subagents) reads the reason off
+    /// the choice; a reply cut off at the token limit must not look finished.
+    #[tokio::test]
+    async fn a_truncated_json_reply_reports_length() {
+        let (addr, _requests) = spawn_choice_stub(serde_json::json!({
+            "message": { "role": "assistant", "content": "The answer is" },
+            "finish_reason": "length",
+        }));
+        let backend =
+            OpenAiBackend::new(format!("http://{addr}/v1"), "test-key", "test-model", None);
+
+        let result = backend
+            .send_message_with_tools("explain", &[], None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "The answer is");
+        assert_eq!(result.finish, FinishReason::Length);
     }
 
     /// A structured call can come back with a broken inline block in the same
