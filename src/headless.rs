@@ -29,7 +29,8 @@ use crate::{permissions, provider, session_store, settings, tools};
 
 pub const USAGE: &str = "Usage: sigit run \"<prompt>\" [--cwd <dir>] [--add-dir <dir>]... \
                          [--output text|jsonl] [--quiet] [--resume <session-id>] \
-                         [--allow-tool <name>]... [--deny-tool <name>]...\n       \
+                         [--allow-tool <name>]... [--deny-tool <name>]... \
+                         [--max-tool-rounds <n>]\n       \
                          sigit -p \"<prompt>\" [same options]";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -62,6 +63,51 @@ pub struct HeadlessConfig {
     pub allow_tools: Vec<String>,
     /// Tools blocked for the run, overriding even settings-level allow.
     pub deny_tools: Vec<String>,
+    /// How many rounds of tool calls the run may make before the model is
+    /// asked for its final message. `--max-tool-rounds`, else
+    /// `SIGIT_MAX_TOOL_ROUNDS`, else the built-in cap.
+    pub max_tool_rounds: usize,
+}
+
+/// Upper bound for `--max-tool-rounds` / `SIGIT_MAX_TOOL_ROUNDS`.
+pub const MAX_TOOL_ROUNDS_LIMIT: usize = 500;
+
+/// Environment override for the tool-round cap of a headless run.
+pub const MAX_TOOL_ROUNDS_ENV: &str = "SIGIT_MAX_TOOL_ROUNDS";
+
+fn parse_tool_rounds(value: &str, source: &str) -> Result<usize, String> {
+    match value.trim().parse::<usize>() {
+        Ok(rounds) if (1..=MAX_TOOL_ROUNDS_LIMIT).contains(&rounds) => Ok(rounds),
+        _ => Err(format!(
+            "{source} must be a whole number from 1 to {MAX_TOOL_ROUNDS_LIMIT}"
+        )),
+    }
+}
+
+/// The tool-round cap for a run: the flag wins, then the environment, then
+/// the built-in cap. An empty environment value counts as unset.
+fn resolve_max_tool_rounds(flag: Option<usize>, env: Option<&str>) -> Result<usize, String> {
+    if let Some(rounds) = flag {
+        return Ok(rounds);
+    }
+    match env.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => parse_tool_rounds(value, MAX_TOOL_ROUNDS_ENV),
+        None => Ok(crate::MAX_TOOL_ROUNDS),
+    }
+}
+
+/// What the model is told when a run would otherwise end with no final
+/// message. `cap_reached` says the tool-round cap is why.
+fn wrap_up_prompt(cap_reached: bool, max_tool_rounds: usize) -> String {
+    let lead = if cap_reached {
+        format!("You have used all {max_tool_rounds} tool rounds available for this run. ")
+    } else {
+        String::new()
+    };
+    format!(
+        "{lead}Write your final message now, without calling any tools: what you did, \
+         what you found, and anything left unfinished."
+    )
 }
 
 /// Parse the process arguments (without argv[0]) for headless mode.
@@ -85,6 +131,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
     let mut resume_session: Option<String> = None;
     let mut allow_tools: Vec<String> = Vec::new();
     let mut deny_tools: Vec<String> = Vec::new();
+    let mut max_tool_rounds: Option<usize> = None;
 
     let mut iter = args.iter().skip(usize::from(run_command));
     while let Some(arg) = iter.next() {
@@ -143,6 +190,12 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
                     .ok_or_else(|| "--deny-tool requires a tool name".to_string())?;
                 deny_tools.push(value.clone());
             }
+            "--max-tool-rounds" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--max-tool-rounds requires a number".to_string())?;
+                max_tool_rounds = Some(parse_tool_rounds(value, "--max-tool-rounds")?);
+            }
             // A mistyped flag must not become the prompt. A prompt that
             // really starts with '-' can still go through -p.
             other if other.starts_with('-') => return Err(format!("unknown argument: {other}")),
@@ -174,6 +227,10 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
 
     let resume = resume_session.is_some();
     let session_id = resume_session.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let max_tool_rounds = resolve_max_tool_rounds(
+        max_tool_rounds,
+        std::env::var(MAX_TOOL_ROUNDS_ENV).ok().as_deref(),
+    )?;
 
     Ok(Some(HeadlessConfig {
         prompt,
@@ -185,6 +242,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<HeadlessConfig>, String> {
         output,
         allow_tools,
         deny_tools,
+        max_tool_rounds,
     }))
 }
 
@@ -350,8 +408,8 @@ fn emit_error(config: &HeadlessConfig, message: &str) {
 }
 
 /// The turn loop: send the prompt, execute tool calls under the permission
-/// policy, feed results back, repeat up to `MAX_TOOL_ROUNDS` — the same shape
-/// as the ACP `handle_prompt`, minus the ACP notifications.
+/// policy, feed results back, repeat up to `config.max_tool_rounds` — the same
+/// shape as the ACP `handle_prompt`, minus the ACP notifications.
 async fn run_prompt(
     backend: &dyn InferenceBackend,
     config: &HeadlessConfig,
@@ -376,7 +434,7 @@ async fn run_prompt(
 
     let mut round = 0;
 
-    while !result.tool_calls.is_empty() && round < crate::MAX_TOOL_ROUNDS {
+    while !result.tool_calls.is_empty() && round < config.max_tool_rounds {
         round += 1;
 
         // Auto-compaction: long tool runs grow history fast; fold it into a
@@ -451,7 +509,7 @@ async fn run_prompt(
             });
         }
 
-        let allow_tool_calls = round < crate::MAX_TOOL_ROUNDS;
+        let allow_tool_calls = round < config.max_tool_rounds;
 
         // Whatever this round says starts a new paragraph rather than
         // continuing the sentence the tool calls interrupted.
@@ -464,6 +522,40 @@ async fn run_prompt(
             config,
         )
         .await?;
+    }
+
+    // A run can reach this point with nothing to show: the last round was
+    // forced to answer in text and the model answered with nothing, most
+    // often because it was cut off at the tool-round cap mid-task. A caller
+    // reading stdout could not tell that from a run with nothing to report,
+    // so ask once, plainly, for the final message.
+    if crate::chat::strip_think_blocks(result.text.trim())
+        .1
+        .is_empty()
+    {
+        let cap_reached = round >= config.max_tool_rounds;
+        if cap_reached {
+            log::warn!(
+                "headless: reached the cap of {} tool round(s) without a final message",
+                config.max_tool_rounds
+            );
+        }
+        reply.interrupt();
+        match drain_to_stdout(
+            backend.send_message_with_tools(
+                &wrap_up_prompt(cap_reached, config.max_tool_rounds),
+                &[],
+                sink_opt,
+            ),
+            &mut sink_rx,
+            &mut reply,
+            config,
+        )
+        .await
+        {
+            Ok(wrap_up) => result = wrap_up,
+            Err(error) => log::warn!("headless: asking for a final message failed: {error}"),
+        }
     }
 
     // Final text: in quiet mode nothing streamed, so print the final assistant
@@ -635,6 +727,49 @@ mod tests {
     fn resume_rejects_unsafe_session_ids() {
         let error = parse_args(&args(&["run", "continue", "--resume", "../escape"])).unwrap_err();
         assert!(error.contains("session ids"), "{error}");
+    }
+
+    #[test]
+    fn max_tool_rounds_flag_is_parsed_and_bounded() {
+        let config = parse_args(&args(&["-p", "work", "--max-tool-rounds", "60"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.max_tool_rounds, 60);
+
+        for bad in ["0", "501", "-1", "many", ""] {
+            let error = parse_args(&args(&["-p", "work", "--max-tool-rounds", bad])).unwrap_err();
+            assert!(error.contains("--max-tool-rounds"), "{bad}: {error}");
+        }
+        assert!(parse_args(&args(&["-p", "work", "--max-tool-rounds"])).is_err());
+    }
+
+    #[test]
+    fn max_tool_rounds_resolves_flag_then_environment_then_default() {
+        assert_eq!(resolve_max_tool_rounds(Some(7), Some("60")), Ok(7));
+        assert_eq!(resolve_max_tool_rounds(None, Some(" 60 ")), Ok(60));
+        assert_eq!(
+            resolve_max_tool_rounds(None, None),
+            Ok(crate::MAX_TOOL_ROUNDS)
+        );
+        // An empty variable is unset, not an error.
+        assert_eq!(
+            resolve_max_tool_rounds(None, Some("")),
+            Ok(crate::MAX_TOOL_ROUNDS)
+        );
+        let error = resolve_max_tool_rounds(None, Some("lots")).unwrap_err();
+        assert!(error.contains(MAX_TOOL_ROUNDS_ENV), "{error}");
+        assert!(resolve_max_tool_rounds(None, Some("0")).is_err());
+    }
+
+    #[test]
+    fn wrap_up_prompt_names_the_cap_only_when_it_was_reached() {
+        let capped = wrap_up_prompt(true, 24);
+        assert!(capped.contains("all 24 tool rounds"), "{capped}");
+        assert!(capped.contains("without calling any tools"));
+
+        let plain = wrap_up_prompt(false, 24);
+        assert!(!plain.contains("tool rounds"), "{plain}");
+        assert!(plain.starts_with("Write your final message now"));
     }
 
     #[test]

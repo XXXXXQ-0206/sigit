@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The tool-round cap of a headless run can be set.** `--max-tool-rounds <n>`
+  or `SIGIT_MAX_TOOL_ROUNDS` (1 to 500) replaces the built-in 24 for
+  `sigit run` and `sigit -p`. The flag wins over the variable.
+
+### Fixed
+
+- **A headless run no longer ends silently with no final message.** When the
+  last round came back empty, which is what happens when a run is cut off at
+  the tool-round cap mid-task, stdout was empty and the exit status was 0, so
+  a caller could not tell it from a run with nothing to report. siGit Code now
+  asks the model once for its final message before finishing.
+
 ## 1.6.0
 
 ### Added

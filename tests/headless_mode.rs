@@ -61,6 +61,22 @@ fn sse_text_then_tool_call(text: &str, id: &str, name: &str, arguments: &str) ->
     ])
 }
 
+/// A non-streaming completion that asks for one tool call. `--quiet` runs do
+/// not stream, so their scripted responses are plain JSON.
+fn json_tool_call(id: &str, name: &str, arguments: &str) -> String {
+    json!({"choices": [{"message": {"content": null, "tool_calls": [{
+        "id": id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }]}}]})
+    .to_string()
+}
+
+/// A non-streaming completion that is only text.
+fn json_text(text: &str) -> String {
+    json!({"choices": [{"message": {"content": text}}]}).to_string()
+}
+
 /// Serves one scripted SSE response per request and records each request body.
 struct FakeEndpoint {
     port: u16,
@@ -163,6 +179,7 @@ fn run_headless(port: u16, scratch: &Scratch, args: &[&str]) -> Output {
         // A fresh config dir means the default permission mode, `ask` — make
         // sure the environment can't turn the gate off underneath the test.
         .env_remove("SIGIT_PERMISSIONS")
+        .env_remove("SIGIT_MAX_TOOL_ROUNDS")
         .env_remove("SIGIT_LOCAL_INFERENCE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -511,6 +528,98 @@ fn text_from_two_tool_rounds_is_not_run_together() {
         !stdout.contains("pattern.Let me"),
         "rounds must not run together into one sentence, got: {stdout:?}"
     );
+}
+
+/// A run cut off at the tool-round cap used to print nothing and exit 0. It
+/// must ask for a final message once, without offering tools, and print that.
+#[test]
+fn run_cut_off_at_the_round_cap_still_ends_with_a_final_message() {
+    let endpoint = start_fake_endpoint(vec![
+        json_tool_call("call_1", "run_command", r#"{"command":"echo one"}"#),
+        json_tool_call("call_2", "run_command", r#"{"command":"echo two"}"#),
+        // The last allowed round is forced to answer in text and says nothing.
+        json_text(""),
+        json_text("Ran two commands; the search is unfinished."),
+    ]);
+    let scratch = scratch("round_cap");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let output = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "-p",
+            "look into it",
+            "--quiet",
+            "--max-tool-rounds",
+            "2",
+            "--allow-tool",
+            "run_command",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "Ran two commands; the search is unfinished.\n"
+    );
+
+    let requests = endpoint.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4, "prompt, two tool rounds, the wrap-up");
+    assert!(
+        requests[1].get("tools").is_some(),
+        "the first tool round may still call tools"
+    );
+    assert!(
+        requests[2].get("tools").is_none(),
+        "the round at the cap is forced to answer in text"
+    );
+    let wrap_up = &requests[3];
+    assert!(
+        wrap_up.get("tools").is_none(),
+        "no tools are offered for the final message"
+    );
+    let last = wrap_up["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "user");
+    let asked = last["content"].as_str().unwrap();
+    assert!(asked.contains("all 2 tool rounds"), "got: {asked}");
+    assert!(asked.contains("final message"), "got: {asked}");
+}
+
+/// A run that ends with a real final message is left alone: no extra request.
+#[test]
+fn run_with_a_final_message_makes_no_wrap_up_request() {
+    let endpoint = start_fake_endpoint(vec![
+        json_tool_call("call_1", "run_command", r#"{"command":"echo one"}"#),
+        json_text("Done: it prints one."),
+    ]);
+    let scratch = scratch("no_wrap_up");
+    let cwd = scratch.cwd.to_str().unwrap().to_string();
+
+    let output = run_headless(
+        endpoint.port,
+        &scratch,
+        &[
+            "-p",
+            "look into it",
+            "--quiet",
+            "--allow-tool",
+            "run_command",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_of(&output), "Done: it prints one.\n");
+    assert_eq!(endpoint.requests.lock().unwrap().len(), 2);
 }
 
 #[test]
