@@ -27,6 +27,11 @@ for interactive permission are denied in headless mode unless granted with
 `--allow-tool <name>`. A repeatable `--deny-tool <name>` takes precedence over grants and
 settings.
 
+A run makes at most 24 rounds of tool calls. `--max-tool-rounds <n>`, or the
+`SIGIT_MAX_TOOL_ROUNDS` environment variable, sets a different cap from 1 to 500; the flag wins.
+When the cap is reached, or the model otherwise ends without saying anything, siGit Code asks it
+once for a final message, so stdout is not left empty by a run that was cut off mid-task.
+
 ## JSONL output
 
 Pass `--output jsonl` for a machine-readable stdout stream:
