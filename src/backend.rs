@@ -289,6 +289,67 @@ pub fn message_image_count(message: &serde_json::Value) -> usize {
 /// task never blocks on a slow consumer.
 pub type TokenSink = tokio::sync::mpsc::UnboundedSender<String>;
 
+/// An image attached to a user message: base64 data and its media type, as an
+/// ACP client sends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInput {
+    pub mime_type: String,
+    pub data: String,
+}
+
+/// What a model that cannot read images is shown in place of one.
+const IMAGE_OMITTED_NOTE: &str = "[image omitted: this model cannot read images]";
+
+/// A user message in history form. Plain text keeps the string `content` every
+/// other message uses; with images it becomes OpenAI's content-part array,
+/// text first, each image as a base64 `data:` URL.
+fn user_message(text: &str, images: &[ImageInput]) -> serde_json::Value {
+    if images.is_empty() {
+        return serde_json::json!({ "role": "user", "content": text });
+    }
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.mime_type, image.data),
+            },
+        }));
+    }
+    serde_json::json!({ "role": "user", "content": parts })
+}
+
+/// `history` as a text-only model has to receive it: a message that carries
+/// images is flattened back to a string, with a note where each image was.
+///
+/// History itself keeps the images. A thread can move to a model that reads
+/// them (or back to one), so what was attached is not thrown away just because
+/// the model active right now cannot use it.
+fn without_images(history: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .map(|message| {
+            let images = message_image_count(message);
+            if images == 0 {
+                return message.clone();
+            }
+            let mut text = message_text(message);
+            for _ in 0..images {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(IMAGE_OMITTED_NOTE);
+            }
+            let mut flattened = message.clone();
+            flattened["content"] = serde_json::Value::String(text);
+            flattened
+        })
+        .collect()
+}
+
 // ── The trait ───────────────────────────────────────────────────────────────────
 
 /// A swappable inference backend driving siGit Code's agent loop.
@@ -326,6 +387,28 @@ pub trait InferenceBackend: Send + Sync {
     /// unanswered makes strict OpenAI-compatible endpoints reject every later
     /// request in the session.
     async fn record_cancelled_tool_results(&self, results: Vec<ToolResult>);
+
+    /// Start a turn from a user message that carries images.
+    ///
+    /// The default drops the images and sends the text, which is right for a
+    /// backend that cannot read them. Callers check [`Self::accepts_images`]
+    /// first so the user can be told, instead of the image vanishing.
+    async fn send_message_with_images(
+        &self,
+        text: &str,
+        images: &[ImageInput],
+        tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
+    ) -> Result<TurnResult, BackendError> {
+        let _ = images;
+        self.send_message_with_tools(text, tools, sink).await
+    }
+
+    /// Whether the model behind this backend reads images. On-device models do
+    /// not; a remote one answers from its model id.
+    fn accepts_images(&self) -> bool {
+        false
+    }
 
     /// Whether inference runs over the network (a configured provider) rather
     /// than on-device. Drives UI labelling so the displayed model can't claim a
@@ -707,6 +790,10 @@ pub struct OpenAiBackend {
     http: reqwest::Client,
     /// The full message list sent on each request (system + turns + tool results).
     history: Mutex<Vec<serde_json::Value>>,
+    /// Whether `model` reads images (see `provider::model_accepts_images`).
+    /// When it does not, images already in `history` are left out of each
+    /// request rather than sent to an endpoint that would refuse them.
+    accepts_images: bool,
 }
 
 impl OpenAiBackend {
@@ -723,10 +810,12 @@ impl OpenAiBackend {
         if let Some(prompt) = system_prompt {
             history.push(serde_json::json!({ "role": "system", "content": prompt }));
         }
+        let model = model.into();
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
-            model: model.into(),
+            accepts_images: crate::provider::model_accepts_images(&model),
+            model,
             http: reqwest::Client::new(),
             history: Mutex::new(history),
         }
@@ -811,9 +900,17 @@ impl OpenAiBackend {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let streaming = sink.is_some();
 
+        let messages = {
+            let history = self.history.lock().await;
+            if self.accepts_images {
+                history.clone()
+            } else {
+                without_images(&history)
+            }
+        };
         let mut body = serde_json::json!({
             "model": self.model,
-            "messages": *self.history.lock().await,
+            "messages": messages,
             "stream": streaming,
         });
         if allow_tool_calls && !tools.is_empty() {
@@ -1377,6 +1474,21 @@ impl InferenceBackend for OpenAiBackend {
                 "content": result.content,
             }));
         }
+    }
+
+    async fn send_message_with_images(
+        &self,
+        text: &str,
+        images: &[ImageInput],
+        tools: &[ToolSpec],
+        sink: Option<&TokenSink>,
+    ) -> Result<TurnResult, BackendError> {
+        self.history.lock().await.push(user_message(text, images));
+        self.complete(tools, true, sink).await
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.accepts_images
     }
 
     fn is_remote(&self) -> bool {
@@ -2112,6 +2224,61 @@ mod tests {
                 }},
             ],
         })
+    }
+
+    #[test]
+    fn user_message_uses_content_parts_only_when_there_is_an_image() {
+        assert_eq!(
+            user_message("hello", &[]),
+            serde_json::json!({ "role": "user", "content": "hello" })
+        );
+
+        let image = ImageInput {
+            mime_type: "image/png".to_string(),
+            data: "AAAA".to_string(),
+        };
+        assert_eq!(
+            user_message("what is this?", std::slice::from_ref(&image)),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                ],
+            })
+        );
+        // An image with no text sends no empty text part.
+        let only_image = user_message("", &[image]);
+        assert_eq!(only_image["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_text_only_model_is_sent_a_note_in_place_of_each_image() {
+        let history = vec![
+            serde_json::json!({ "role": "system", "content": "prompt" }),
+            user_with_image("what is this?", 16),
+            serde_json::json!({ "role": "assistant", "content": "a cat" }),
+        ];
+        let sent = without_images(&history);
+
+        assert_eq!(sent[0], history[0]);
+        assert_eq!(sent[2], history[2]);
+        assert_eq!(
+            sent[1]["content"],
+            format!("what is this?\n{IMAGE_OMITTED_NOTE}")
+        );
+        // History keeps the image for a model that can read it later.
+        assert_eq!(message_image_count(&history[1]), 1);
+    }
+
+    #[test]
+    fn a_remote_backend_reads_images_by_model_id() {
+        let own_endpoint = OpenAiBackend::new("http://localhost", "", "gpt-4o-mini", None);
+        assert!(own_endpoint.accepts_images());
+        let text_tier = OpenAiBackend::new("http://localhost", "", "onde-nova", None);
+        assert!(!text_tier.accepts_images());
+        let image_tier = OpenAiBackend::new("http://localhost", "", "onde-large", None);
+        assert!(image_tier.accepts_images());
     }
 
     #[test]

@@ -131,6 +131,17 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   well-formed ones. A block that doesn't parse (or never closes) is dropped from both the reply
   and history, and `OpenAiBackend::complete` retries once with a note telling the model the call
   didn't run. Leaving the raw block in history makes the model invent `<function_results>` later.
+  Image attachments: ACP fixes `promptCapabilities.image` for the whole connection, while the
+  model can change on any turn, so the capability is always advertised and the decision is made
+  per prompt. `InferenceBackend::accepts_images` answers for the active model (on-device: no;
+  remote: `provider::model_accepts_images`, which reads the hard-coded `IMAGE_TIERS` for
+  `onde-*` ids and says yes for a user's own endpoint). `images_for_turn` in `main.rs` either
+  passes the images to `send_message_with_images` or drops them with a note to the user and a
+  bracketed note to the model. A message with images is stored in history as OpenAI content
+  parts and stays that way; `OpenAiBackend` strips the images per request (`without_images`)
+  when its model cannot read them, which is what makes a mid-thread switch to a text-only tier
+  safe. Read history text through `backend::message_text`, never `content.as_str()`.
+  `IMAGE_TIERS` mirrors onde-cloud's `IMAGE_CANDIDATES`; update both together.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.

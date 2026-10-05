@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Images can be attached to a prompt in the editor.** siGit Code now
+  advertises `promptCapabilities.image`, so an ACP client offers image
+  attachments. The image goes to the model when the active model reads images.
+  The model picker marks those models with "reads images". The on-device
+  models and four cloud tiers (`nova`, `orbit`, `apex`, `flux`) are text-only:
+  with one of them active the image is left out, a note in the thread says so,
+  and the model is told an image was withheld. Switching a thread that already
+  holds images to a text-only model flags that once as well. Cloud tiers need
+  siGit Code Cloud to accept image parts, which is rolling out separately
+  (#134).
+
 - **The tool-round cap of a headless run can be set.** `--max-tool-rounds <n>`
   or `SIGIT_MAX_TOOL_ROUNDS` (1 to 500) replaces the built-in 24 for
   `sigit run` and `sigit -p`. The flag wins over the variable.
