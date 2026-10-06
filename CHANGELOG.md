@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.6.3
+
+### Added
+
+- **A client can resume a session and close one.** siGit Code now advertises
+  `sessionCapabilities.resume` and `sessionCapabilities.close`.
+  `session/resume` restores a saved thread the way `session/load` does, but
+  sends none of it back: it is for a client that still has the thread on
+  screen, after an agent restart for example. `session/close` cancels the
+  session's running turn and drops what the process held for it, which is its
+  state, its permission grants and plan mode, the MCP servers the client named
+  for it, and the background commands it started. The saved history is left
+  alone, so a closed thread still lists and reopens (#149).
+
+- **The permission modes are also offered as ACP session modes.** Manual, Auto
+  and Plan were only reachable as a config option, which is what the protocol
+  now recommends and what Zed reads. A client that draws the older mode
+  selector saw nothing. `session/new`, `session/load` and `session/fork` now
+  return the same three in `modes`, `session/set_mode` switches between them,
+  and a change made any other way (the config option, `/plan`, `/clear`,
+  `/reload`) is announced with `current_mode_update`. A client that reads
+  config options ignores `modes`, so nothing changes there (#148).
+
+- **An editor can sign out of siGit Code.** The `initialize` reply carried an
+  empty `auth` object, so a client drew no sign out button, and typing
+  `/logout` was the only way out of an account. The reply now advertises
+  `agentCapabilities.auth.logout`, and a `logout` request ends the account
+  session through the method `/logout` calls. The request names no session,
+  so it moves every open thread that used the account, not only the live one:
+  a thread parked on a cloud tier goes on-device with the live thread instead
+  of failing to restore its tier on its next prompt, and every thread that
+  moved gets a fresh model picker. Local inference is switched back on if it
+  was off, so a thread opened after signing out asks for no cloud tier
+  (#150).
+
+### Changed
+
+- **Two threads can run a turn at the same time.** An editor runs one siGit
+  Code process for every thread it has open, and a single lock ordered every
+  turn-affecting request in it, so a second prompt waited for the first
+  thread's whole turn and two prompts never overlapped. The lock held what a
+  session installs process-wide — the working directory, the workspace roots,
+  the MCP servers the client named for it, the live backend — none of which a
+  turn touches while it waits on an HTTP endpoint, which is most of its time.
+  A session on an HTTP backend now keeps a backend of its own, so its
+  conversation is no longer swapped in and out of a shared one, and a turn
+  releases the process-wide lock while it waits on the endpoint or on a
+  permission answer and takes it back, reinstalling its session, before any
+  tool runs. On-device turns are unchanged, since the engine keeps one
+  conversation, and tool execution still runs one session at a time (#176).
+
+### Fixed
+
+- **A prompt whose inference failed is kept through a model switch.** A turn
+  that ended in an endpoint error stayed in the client's thread, but the
+  carryover into a new model dropped its trailing user message, and the error
+  path never saved the session. Only a cancelled prompt should be taken back
+  out, so cancellation now removes it from the live history, and the error
+  path persists the session (#124).
+
 ## 1.6.2
 
 ### Added

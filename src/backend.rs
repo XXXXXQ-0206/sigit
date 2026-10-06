@@ -445,6 +445,15 @@ pub trait InferenceBackend: Send + Sync {
     /// local model while requests actually go to the cloud.
     fn is_remote(&self) -> bool;
 
+    /// A backend for the same endpoint and model with an empty conversation,
+    /// or `None` when the conversation cannot be separated from the backend
+    /// (on-device, the engine holds it). An editor keeps several threads open
+    /// in one process; this is what lets each of them own its history instead
+    /// of taking turns on a shared one.
+    fn fresh(&self) -> Option<Arc<dyn InferenceBackend>> {
+        None
+    }
+
     /// A serializable snapshot of the conversation history, one JSON object per
     /// message (`{"role": ..., "content": ...}` at minimum). The snapshot is
     /// what the session store persists; it includes any seeded system message
@@ -1554,6 +1563,19 @@ impl InferenceBackend for OpenAiBackend {
         true
     }
 
+    fn fresh(&self) -> Option<Arc<dyn InferenceBackend>> {
+        Some(Arc::new(Self {
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            // The client is a handle on one connection pool; sharing it keeps
+            // connections to the endpoint warm across sessions.
+            http: self.http.clone(),
+            history: Mutex::new(Vec::new()),
+            accepts_images: self.accepts_images,
+        }))
+    }
+
     async fn history_snapshot(&self) -> Vec<serde_json::Value> {
         self.history.lock().await.clone()
     }
@@ -1944,18 +1966,25 @@ pub fn carryover_history(snapshot: Vec<serde_json::Value>) -> Vec<serde_json::Va
         }
     }
 
-    // Session switches happen only after the serialized turn has ended. A
-    // trailing user message therefore belongs to a cancelled/failed inference
-    // request with no answer; carrying it would make the next activation feed
-    // the model an orphaned prompt that the client considers cancelled.
-    while carried
+    carried
+}
+
+/// Take a cancelled prompt's user message back out of the live history.
+///
+/// The client drops a cancelled prompt from its thread, so the model must not
+/// keep answering it. Only the first inference round can cancel with the user
+/// message as the last entry; later rounds end on tool or assistant output.
+/// A prompt that fails with an error is not taken back: the client keeps it,
+/// so the history keeps it too and a model switch carries it over.
+pub async fn forget_trailing_user_message(backend: &dyn InferenceBackend) {
+    let mut history = backend.history_snapshot().await;
+    if history
         .last()
         .is_some_and(|message| message["role"] == "user")
     {
-        carried.pop();
+        history.pop();
+        backend.restore_history(history).await;
     }
-
-    carried
 }
 
 /// Replay `carried` (from [`carryover_history`]) into `backend`, on top of the
@@ -2161,16 +2190,39 @@ mod tests {
     }
 
     #[test]
-    fn carryover_drops_a_cancelled_trailing_user_message() {
+    fn carryover_keeps_a_trailing_user_message_from_a_failed_turn() {
+        // The client keeps a prompt whose inference errored, so a switch must
+        // not drop it (issue #124).
         let carried = carryover_history(vec![
             serde_json::json!({ "role": "system", "content": "prompt" }),
             serde_json::json!({ "role": "user", "content": "completed question" }),
             serde_json::json!({ "role": "assistant", "content": "completed answer" }),
-            serde_json::json!({ "role": "user", "content": "cancelled question" }),
+            serde_json::json!({ "role": "user", "content": "failed question" }),
         ]);
 
-        assert_eq!(carried.len(), 2, "{carried:#?}");
-        assert_eq!(carried.last().unwrap()["content"], "completed answer");
+        assert_eq!(carried.len(), 3, "{carried:#?}");
+        assert_eq!(carried.last().unwrap()["content"], "failed question");
+    }
+
+    #[tokio::test]
+    async fn forget_trailing_user_message_drops_only_a_cancelled_prompt() {
+        let backend = OpenAiBackend::new("http://localhost", "", "m", None);
+        backend
+            .restore_history(vec![
+                serde_json::json!({ "role": "user", "content": "completed question" }),
+                serde_json::json!({ "role": "assistant", "content": "completed answer" }),
+                serde_json::json!({ "role": "user", "content": "cancelled question" }),
+            ])
+            .await;
+
+        forget_trailing_user_message(&backend).await;
+
+        let history = backend.history_snapshot().await;
+        assert_eq!(history.len(), 2, "{history:#?}");
+        assert_eq!(history[1]["content"], "completed answer");
+
+        forget_trailing_user_message(&backend).await;
+        assert_eq!(backend.history_snapshot().await.len(), 2);
     }
 
     #[test]

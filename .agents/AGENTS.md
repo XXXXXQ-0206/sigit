@@ -113,9 +113,20 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
 - **`src/main.rs`** — entry point, mode dispatch, the full ACP `Agent` impl (session lifecycle:
   new/load/fork/prompt/cancel, config options, slash-command advertisement), and the `SYSTEM_PROMPT`.
   ACP session state owns its roots, conversation, and selected model even though the process has
-  one live backend; activating a thread parks and restores all three. Unknown session ids are
-  rejected instead of silently borrowing the active thread's cwd. Prompt cancellation is routed
-  outside `turn_lock`, which lets a client cancel the turn currently holding that lock. The
+  one working directory and one live backend slot; activating a thread parks and restores all
+  three. A thread on an HTTP backend keeps a backend of its own (`InferenceBackend::fresh`,
+  `SessionState::remote`), so its turn can wait on the endpoint while another thread is
+  installed. Unknown session ids are rejected instead of silently borrowing the active thread's
+  cwd. Prompt cancellation takes no lock, which lets a client cancel a turn whatever it holds.
+  `session/load` and `session/resume` share `restore_session`; the only difference is that
+  resume must not replay the history as `session/update`. `session/close` is the one place a
+  `SessionState` is dropped. It runs in two halves: `begin_close` signals the session's turn
+  from the dispatch loop (the turn holds the session's lock, so the signal cannot wait for it) and
+  marks the id in `closing_sessions`, which makes `handle_prompt` cancel a prompt that was
+  still queued; `handle_close_session` then runs under the session and workspace locks and
+  removes the state, the permission grants and the background commands
+  (`tools::kill_session_tasks`). It leaves `session_store` alone, so a closed thread still lists
+  and reopens. The
   `SYSTEM_PROMPT` bakes in smbCloud-specific context the agent should use when the repo is clearly
   smbCloud, and stay general otherwise.
 - **`src/backend.rs`** — the `InferenceBackend` trait and neutral types (`ToolSpec`, `ToolCall`,
@@ -268,10 +279,21 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   announced, because it sets the announced status: a call that will ask starts `pending`, the
   permission request carries that call's own id, and an `in_progress` update follows approval.
   That update also puts the card's title back, since the permission request overwrites it
-  with the full arguments. Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
-  serialized by `SiGitAgent::turn_lock` so the dispatch loop can route the client's permission
-  answer mid-turn — don't move them back inline, and don't await client requests from inline
-  handlers (deadlock).
+  with the full arguments. The Manual/Auto/Plan choice reaches an ACP client twice: as the
+  `sigit-permission-mode` config option, and as session `modes` with `session/set_mode`, which
+  the spec is retiring but some clients still render instead. Both are built from
+  `PERMISSION_MODES` in `main.rs` and read the same state, so whatever changes the mode has to
+  refresh both (`ConfigOptionUpdate` and `send_current_mode`). Note: ACP turn-affecting handlers run in `cx.spawn`ed tasks
+  so the dispatch loop can route the client's permission answer mid-turn — don't move them back
+  inline, and don't await client requests from inline handlers (deadlock). Two locks order them.
+  A per-session lock (`SiGitAgent::session_lock`) is held for a whole request, so requests on one
+  thread keep their order. `SiGitAgent::workspace_lock` guards what a session installs
+  process-wide (cwd, workspace roots, session MCP servers, the live backend slot, the engine's
+  conversation); lifecycle and config handlers hold it throughout, and `handle_prompt` holds it
+  through a `WorkspaceHold` that it releases while waiting on an HTTP endpoint or a permission
+  answer and retakes (reinstalling its session via `resume_workspace`) before any tool runs. An
+  on-device turn never releases it. Take the session lock first, never the other way round. Tool
+  execution, subagents included, still runs one session at a time.
 - **`src/instructions.rs`** — project instruction files, the always-on counterpart to skills.
   Reads `AGENTS.md` (the cross-tool [agents.md](https://agents.md) standard) and `CLAUDE.md`,
   walking from the session cwd up to the repo root (nearest ancestor with `.git`, never above it),
@@ -337,6 +359,10 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   those read env vars once at init.
 - **`src/account.rs`** — siGit Code Cloud auth (`/login`, `/logout`, `/whoami`); authenticates
   against the account API and stores a session token. Performs no console I/O.
+  ACP `logout` (the editor's sign out button, shown only because `handle_initialize` advertises
+  `agentCapabilities.auth.logout`) and `/logout` both go through `SiGitAgent::sign_out` in
+  `main.rs`. The request names no session, so `leave_cloud` moves the parked threads off their
+  cloud tier along with the live one and each of them gets a fresh model picker.
 - **`src/browser_auth.rs`** — browser sign-in, the path the editor's "Sign in to siGit Code"
   button takes. sigit is a public OAuth client (client id `sigit-code-cli`, no secret, PKCE
   S256) against the authorization server at `$SIGIT_API_URL/oauth`. Two ways the code gets
