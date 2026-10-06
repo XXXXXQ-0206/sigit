@@ -1,6 +1,6 @@
 [package]
 name = "sigit"
-version = "1.6.1"
+version = "1.6.2"
 edition = "2024"
 description = "siGit Code — ACP-compatible AI coding agent. Sí, git."
 documentation = "https://github.com/getsigit/sigit"
@@ -59,6 +59,11 @@ rpassword = "7"
 base64 = "0.22"
 rand = "0.9"
 sha2 = "0.10"
+
+# ACP `resource_link` blocks carry file URIs. Parsing them with `url` decodes
+# percent escapes and maps Windows drive paths, which hand-stripping `file://`
+# did not. Already in the graph through reqwest.
+url = "2"
 
 # Release binaries ship to five registries, and the NuGet package bundles all
 # six targets in a single archive, so binary size is a distribution constraint

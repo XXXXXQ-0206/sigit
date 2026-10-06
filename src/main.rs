@@ -32,6 +32,7 @@ mod account;
 mod backend;
 mod browser_auth;
 mod chat;
+mod client_fs;
 mod commands;
 mod credentials;
 mod frontmatter;
@@ -77,13 +78,14 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, McpServer, Meta, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities,
-    PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
-    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigValueId, SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent, ToolCallLocation,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+    WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -878,6 +880,46 @@ fn initialize_meta() -> Meta {
     meta
 }
 
+/// The editor's file system, reached over the ACP connection. Registered with
+/// `client_fs` at `initialize` when the client advertises `fs` capabilities.
+struct AcpClientFs {
+    cx: ConnectionTo<Client>,
+}
+
+#[async_trait::async_trait]
+impl client_fs::ClientFileSystem for AcpClientFs {
+    async fn read_text_file(
+        &self,
+        session_id: &str,
+        path: &std::path::Path,
+    ) -> Result<String, String> {
+        self.cx
+            .send_request(ReadTextFileRequest::new(session_id.to_string(), path))
+            .block_task()
+            .await
+            .map(|response| response.content)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn write_text_file(
+        &self,
+        session_id: &str,
+        path: &std::path::Path,
+        content: &str,
+    ) -> Result<(), String> {
+        self.cx
+            .send_request(WriteTextFileRequest::new(
+                session_id.to_string(),
+                path,
+                content,
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// What one ACP session owns, kept per session id.
 ///
 /// An editor runs a single sigit process for every thread it has open, but the
@@ -1659,9 +1701,30 @@ fn validate_session_roots(
 impl SiGitAgent {
     async fn handle_initialize(
         &self,
-        _req: InitializeRequest,
+        cx: &ConnectionTo<Client>,
+        req: InitializeRequest,
     ) -> agent_client_protocol::Result<InitializeResponse> {
         log::info!("initialize");
+
+        // A client that serves files from its buffers gets the file tools'
+        // reads and writes (see `client_fs`). Only the connection is kept
+        // here: asking the client for anything from this handler would
+        // deadlock, and the tools ask from inside a spawned prompt turn.
+        let fs = &req.client_capabilities.fs;
+        if client_fs::disabled_by_env() {
+            log::info!("client file system: off (SIGIT_CLIENT_FS)");
+        } else {
+            log::info!(
+                "client file system: read={}, write={}",
+                fs.read_text_file,
+                fs.write_text_file
+            );
+            client_fs::register(
+                Arc::new(AcpClientFs { cx: cx.clone() }),
+                fs.read_text_file,
+                fs.write_text_file,
+            );
+        }
 
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
         // like Zed advertise terminal-auth capability but don't actually spawn the
@@ -2339,24 +2402,8 @@ impl SiGitAgent {
                     // reference without content; read the file ourselves
                     let label = link.name.clone();
 
-                    if let Some(raw_path) = link.uri.strip_prefix("file://") {
-                        let (file_path, line_range) = if let Some(hash_pos) = raw_path.rfind('#') {
-                            let fragment = &raw_path[hash_pos + 1..];
-                            let path = &raw_path[..hash_pos];
-                            // Parse "L207:219" or "L207-219" → (207, 219)
-                            let range = fragment.strip_prefix('L').and_then(|rest| {
-                                let sep = if rest.contains(':') { ':' } else { '-' };
-                                let mut parts = rest.splitn(2, sep);
-                                let start = parts.next()?.parse::<usize>().ok()?;
-                                let end = parts.next()?.parse::<usize>().ok()?;
-                                Some((start, end))
-                            });
-                            (path, range)
-                        } else {
-                            (raw_path, None)
-                        };
-
-                        match std::fs::read_to_string(file_path) {
+                    if let Some((file_path, line_range)) = parse_file_link(&link.uri) {
+                        match std::fs::read_to_string(&file_path) {
                             Ok(contents) => {
                                 let extracted = if let Some((start, end)) = line_range {
                                     let selected: Vec<&str> = contents
@@ -2369,19 +2416,24 @@ impl SiGitAgent {
                                         .map(|(_, line)| line)
                                         .collect();
                                     format!(
-                                        "\n--- {label} ({file_path} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        "\n--- {label} ({} lines {start}-{end}) ---\n{}\n--- end {label} ---",
+                                        file_path.display(),
                                         selected.join("\n")
                                     )
                                 } else {
                                     format!(
-                                        "\n--- {label} ({file_path}) ---\n{contents}\n--- end {label} ---"
+                                        "\n--- {label} ({}) ---\n{contents}\n--- end {label} ---",
+                                        file_path.display()
                                     )
                                 };
                                 parts.push(extracted);
                             }
                             Err(err) => {
                                 log::warn!("could not read ResourceLink {}: {err}", link.uri);
-                                parts.push(format!("[referenced file: {label} ({file_path})]"));
+                                parts.push(format!(
+                                    "[referenced file: {label} ({})]",
+                                    file_path.display()
+                                ));
                             }
                         }
                     } else {
@@ -3953,6 +4005,31 @@ fn parse_slash(input: &str) -> Option<SlashCommand> {
     })
 }
 
+/// Resolves an ACP `resource_link` URI to a local path and an optional line
+/// range. Parsing with `url` decodes percent escapes (`%20`, non-ASCII names),
+/// maps Windows drive URIs, and reads `#` only as the fragment separator, so a
+/// `#` inside a file name stays part of the path. `None` for anything that is
+/// not a local `file:` URI.
+fn parse_file_link(uri: &str) -> Option<(PathBuf, Option<(usize, usize)>)> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    let range = url.fragment().and_then(parse_line_range);
+    Some((path, range))
+}
+
+/// Parses a `L207:219` or `L207-219` fragment into `(207, 219)`.
+fn parse_line_range(fragment: &str) -> Option<(usize, usize)> {
+    let rest = fragment.strip_prefix('L')?;
+    let sep = if rest.contains(':') { ':' } else { '-' };
+    let mut parts = rest.splitn(2, sep);
+    let start = parts.next()?.parse::<usize>().ok()?;
+    let end = parts.next()?.parse::<usize>().ok()?;
+    Some((start, end))
+}
+
 /// ACP clients may prepend context as separate text blocks before the user's
 /// input. Search from the end so a standalone slash command in the final user
 /// block is still dispatched locally instead of being buried in joined context.
@@ -4781,8 +4858,8 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: InitializeRequest, responder, _cx: ConnectionTo<Client>| {
-                    handle_response(responder, state.handle_initialize(req).await)
+                async move |req: InitializeRequest, responder, cx: ConnectionTo<Client>| {
+                    handle_response(responder, state.handle_initialize(&cx, req).await)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -4975,6 +5052,12 @@ async fn main() -> anyhow::Result<()> {
     // directly from a shell. These must be handled before the TTY/ACP split.
     if let Some(verb) = std::env::args().nth(1) {
         match verb.as_str() {
+            // Printed before logging or any model setup, so a script can ask
+            // which release it has without starting a session.
+            "--version" | "-V" => {
+                println!("sigit {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "login" => {
                 init_logging(true);
                 // `--password` keeps the old email/password prompt for anyone
@@ -5116,6 +5199,70 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compares path components so the tests pass on both Unix (forward slashes)
+    /// and Windows (`to_file_path` yields backslashes). On Windows the expected
+    /// string uses forward slashes too; `Path::components` normalizes both.
+    fn assert_path_components(actual: &std::path::Path, expected: &str) {
+        let expected: Vec<_> = std::path::Path::new(expected).components().collect();
+        let actual: Vec<_> = actual.components().collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// On Windows `to_file_path` requires a drive letter, so the test URIs use
+    /// `C:` and the expected paths mirror that. On Unix the URIs use plain
+    /// `/tmp`/`/Users` roots.
+    #[cfg(unix)]
+    #[test]
+    fn file_links_decode_percent_escapes_and_non_ascii_names() {
+        let (path, range) = parse_file_link("file:///Users/me/My%20Project/a.rs").unwrap();
+        assert_path_components(&path, "/Users/me/My Project/a.rs");
+        assert_eq!(range, None);
+
+        let (path, _) = parse_file_link("file:///Users/me/%C3%A9t%C3%A9/notes.md").unwrap();
+        assert_path_components(&path, "/Users/me/été/notes.md");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_links_decode_percent_escapes_and_non_ascii_names() {
+        let (path, range) = parse_file_link("file:///C:/Users/me/My%20Project/a.rs").unwrap();
+        assert_path_components(&path, "C:/Users/me/My Project/a.rs");
+        assert_eq!(range, None);
+
+        let (path, _) = parse_file_link("file:///C:/Users/me/%C3%A9t%C3%A9/notes.md").unwrap();
+        assert_path_components(&path, "C:/Users/me/été/notes.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_links_keep_a_hash_in_the_file_name_and_read_the_line_fragment() {
+        let (path, range) = parse_file_link("file:///tmp/c%23/a%23b.rs#L207:219").unwrap();
+        assert_path_components(&path, "/tmp/c#/a#b.rs");
+        assert_eq!(range, Some((207, 219)));
+
+        let (path, range) = parse_file_link("file:///tmp/a.rs#L3-5").unwrap();
+        assert_path_components(&path, "/tmp/a.rs");
+        assert_eq!(range, Some((3, 5)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_links_keep_a_hash_in_the_file_name_and_read_the_line_fragment() {
+        let (path, range) = parse_file_link("file:///C:/tmp/c%23/a%23b.rs#L207:219").unwrap();
+        assert_path_components(&path, "C:/tmp/c#/a#b.rs");
+        assert_eq!(range, Some((207, 219)));
+
+        let (path, range) = parse_file_link("file:///C:/tmp/a.rs#L3-5").unwrap();
+        assert_path_components(&path, "C:/tmp/a.rs");
+        assert_eq!(range, Some((3, 5)));
+    }
+
+    #[test]
+    fn file_links_reject_non_file_uris() {
+        assert!(parse_file_link("https://example.com/a.rs").is_none());
+        assert!(parse_file_link("not a uri").is_none());
+    }
 
     #[test]
     fn stop_reasons_follow_the_round_cap_then_the_finish_reason() {
