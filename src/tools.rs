@@ -2737,6 +2737,9 @@ fn dropped_note(dropped: bool) -> &'static str {
 }
 
 /// `command_output` tool: output since the last poll + running/exited status.
+/// Only the tests use this one-shot form; production goes through
+/// `exec_command_output_wait`, which long-polls instead of spinning.
+#[cfg(test)]
 fn exec_command_output(arguments: &str, owner: Option<&str>) -> String {
     poll_command_output(arguments, owner, false).text
 }
