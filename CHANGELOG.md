@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.6.2
 
 ### Added
 
@@ -8,6 +8,25 @@
   print `sigit <version>` on stdout and exit 0. Before, the flag was not
   recognized and siGit Code started a session, which left a script that asked
   for the version waiting.
+
+- **File tools read and write through the editor when it offers to.** An ACP
+  client that advertises `fs.readTextFile` or `fs.writeTextFile` serves those
+  requests from its open buffers. siGit Code always used the disk, so
+  `read_file` missed unsaved changes and `edit_file` wrote underneath a buffer
+  the user might have modified. `read_file`, `create_file`, `edit_file` and
+  `multi_edit` now go through the client for paths inside the session's roots.
+  The two capabilities are independent, and the disk is still the fallback:
+  for a path outside the roots, and for a request the client fails or leaves
+  unanswered for 30 seconds. `SIGIT_CLIENT_FS=off` keeps the file tools on
+  disk (#147).
+
+### Fixed
+
+- **A file attached from the editor is found when its path needs escaping.**
+  A `resource_link` was read by stripping `file://` and using the rest as the
+  path, so a space arrived as `%20`, a non-ASCII name failed, and a Windows
+  URI kept its leading slash. A `#` in a file name was also taken for the
+  line-range fragment. The URI is now parsed properly (#170).
 
 ## 1.6.1
 
