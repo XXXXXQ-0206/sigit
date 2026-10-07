@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.6.4
+
+### Added
+
+- **DeepSeek DSML tool calls written into the reply text are recovered.** A
+  DeepSeek-family endpoint can render a tool call as literal
+  `<｜DSML｜tool_calls>` text instead of the structured `tool_calls` field,
+  which streamed the tag into the editor and ended the turn with nothing run.
+  The inline tool-call scanner that already recovered the GLM XML and Kimi K3
+  shapes now recovers the DSML shape too, including a marker split across
+  stream chunks. A block that fails to parse is still kept out of the reply
+  and the history, and the model is told the call did not run (#181).
+
+### Fixed
+
+- **The round-cap stop message no longer carries a stray run of spaces.**
+  When the tool-round cap ended a turn, the closing message could collapse a
+  space run into the wrong spot, which the editor then rendered verbatim
+  (#177).
+
 ## 1.6.3
 
 ### Added
