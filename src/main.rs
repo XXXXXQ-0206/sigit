@@ -416,6 +416,17 @@ struct PromptCancellation {
     notify: tokio::sync::Notify,
 }
 
+impl PromptCancellation {
+    /// Resolves once the turn has been cancelled. `notify_one` leaves a permit
+    /// behind when nobody is waiting, so a signal sent just before this is
+    /// polled is not lost.
+    async fn cancelled(&self) {
+        while !self.cancelled.load(Ordering::Acquire) {
+            self.notify.notified().await;
+        }
+    }
+}
+
 enum DrainTurnError {
     Backend(backend::BackendError),
     Cancelled,
@@ -1024,6 +1035,39 @@ impl WorkspaceHold {
     }
 }
 
+/// One session's lock, held for a request on it.
+///
+/// Dropping it also drops the session's entry in `session_locks` when the
+/// request leaves no such session behind, which is what `session/close` does
+/// and what any request naming an id nobody opened does.
+struct SessionGuard {
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    agent: Arc<SiGitAgent>,
+    key: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if self.agent.sessions.lock().unwrap().contains_key(&self.key) {
+            return;
+        }
+        let held = tokio::sync::OwnedMutexGuard::mutex(&self.guard);
+        let mut locks = self.agent.session_locks.lock().unwrap();
+        // Two handles mean the map's and this guard's. A request still queued
+        // on the lock holds a third, and then the entry stays: taking it out
+        // would give the next request for this id a fresh lock, and the two
+        // would no longer wait for each other. The queued request drops the
+        // entry when its own guard goes. `lock_session` clones under this
+        // mutex, so the count cannot grow before the entry is removed.
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::ptr_eq(lock, held) && Arc::strong_count(lock) == 2)
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 struct SiGitAgent {
     engine: Arc<ChatEngine>,
     /// The active inference backend. `LocalBackend` by default; swapped to an
@@ -1071,7 +1115,8 @@ struct SiGitAgent {
     workspace_lock: Arc<tokio::sync::Mutex<()>>,
     /// One lock per session id, held for a whole request on that session, so
     /// two requests on the same thread keep the order they arrived in. Always
-    /// taken before `workspace_lock`, never while holding it.
+    /// taken before `workspace_lock`, never while holding it. A closed
+    /// session's entry is dropped by `SessionGuard`.
     session_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -2014,15 +2059,21 @@ impl SiGitAgent {
         }
     }
 
-    /// The lock that orders requests on one session (see `session_locks`).
-    fn session_lock(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(
+    /// Take the lock that orders requests on one session (see `session_locks`).
+    async fn lock_session(self: &Arc<Self>, session_id: &SessionId) -> SessionGuard {
+        let key = session_id.to_string();
+        let lock = Arc::clone(
             self.session_locks
                 .lock()
                 .unwrap()
-                .entry(session_id.to_string())
+                .entry(key.clone())
                 .or_default(),
-        )
+        );
+        SessionGuard {
+            guard: lock.lock_owned().await,
+            agent: Arc::clone(self),
+            key,
+        }
     }
 
     /// Keep the active session's parked metadata in step with a successful
@@ -2121,14 +2172,26 @@ impl SiGitAgent {
 
     /// Take `workspace_lock` back after a turn gave it up, and make the turn's
     /// session the installed one again if another was installed meanwhile.
-    async fn resume_workspace(&self, workspace: &mut WorkspaceHold, session_id: &SessionId) {
+    ///
+    /// A turn whose session cannot be reinstalled is cancelled: whatever it ran
+    /// next would run in another session's directory and roots. The turn holds
+    /// its session's lock, which `session/close` waits for, so nothing takes
+    /// the session away today. The turn does not rely on that.
+    async fn resume_workspace(
+        &self,
+        workspace: &mut WorkspaceHold,
+        session_id: &SessionId,
+        cancellation: &PromptCancellation,
+    ) {
         if workspace.reacquire().await
             && let Err(error) = self.activate_session(session_id).await
         {
             log::warn!(
-                "session({session_id}): could not reinstall mid-turn: {}",
+                "session({session_id}): could not reinstall mid-turn, cancelling the turn: {}",
                 error.message
             );
+            cancellation.cancelled.store(true, Ordering::Release);
+            cancellation.notify.notify_one();
         }
     }
 
@@ -2969,7 +3032,8 @@ impl SiGitAgent {
                 &cancellation,
             )
             .await;
-        self.resume_workspace(&mut workspace, &session_id).await;
+        self.resume_workspace(&mut workspace, &session_id, &cancellation)
+            .await;
         let mut result = match outcome {
             Ok(result) => result,
             Err(DrainTurnError::Cancelled) => {
@@ -3158,16 +3222,28 @@ impl SiGitAgent {
                             if release_while_waiting {
                                 workspace.release();
                             }
-                            let verdict = self
-                                .request_tool_permission(
+                            // A client that cancels the turn answers the
+                            // request itself. One that closes the session
+                            // need not, so the wait ends on either.
+                            let verdict = tokio::select! {
+                                verdict = self.request_tool_permission(
                                     cx,
                                     &session_id,
                                     &tc.id,
                                     &tc.name,
                                     &tc.arguments,
-                                )
+                                ) => verdict,
+                                _ = cancellation.cancelled() => PermissionVerdict::TurnCancelled,
+                            };
+                            self.resume_workspace(&mut workspace, &session_id, &cancellation)
                                 .await;
-                            self.resume_workspace(&mut workspace, &session_id).await;
+                            // An approval can cross a cancellation on the wire,
+                            // or arrive while this turn waited for the lock.
+                            let verdict = if cancellation.cancelled.load(Ordering::Acquire) {
+                                PermissionVerdict::TurnCancelled
+                            } else {
+                                verdict
+                            };
                             match verdict {
                                 PermissionVerdict::Approved => {
                                     // The call the user just approved leaves
@@ -3308,7 +3384,8 @@ impl SiGitAgent {
                     &cancellation,
                 )
                 .await;
-            self.resume_workspace(&mut workspace, &session_id).await;
+            self.resume_workspace(&mut workspace, &session_id, &cancellation)
+                .await;
             result = match outcome {
                 Ok(result) => result,
                 Err(DrainTurnError::Cancelled) => {
@@ -5371,8 +5448,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_load_session(&task_cx, req).await)
                     })
@@ -5387,8 +5463,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_resume_session(&task_cx, req).await)
                     })
@@ -5405,8 +5480,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     state.begin_close(&req.session_id);
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_close_session(req).await)
                     })
@@ -5423,8 +5497,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     cx.spawn(async move {
                         // The source's lock: a fork copies its conversation,
                         // which has to be between turns.
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(responder, state.handle_fork_session(&task_cx, req).await)
                     })
@@ -5453,8 +5526,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         handle_response(responder, state.handle_prompt(&task_cx, req).await)
                     })
                 }
@@ -5470,8 +5542,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
@@ -5489,8 +5560,7 @@ async fn run_acp_server(auto_load_local_model: bool) -> anyhow::Result<()> {
                     let state = Arc::clone(&state);
                     let task_cx = cx.clone();
                     cx.spawn(async move {
-                        let session = state.session_lock(&req.session_id);
-                        let _session = session.lock().await;
+                        let _session = state.lock_session(&req.session_id).await;
                         let _workspace = state.workspace_lock.lock().await;
                         handle_response(
                             responder,
@@ -6388,6 +6458,89 @@ mod tests {
             std::env::remove_var("SIGIT_LOCAL_INFERENCE");
         }
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_session_lock_entry_goes_once_its_session_and_its_waiters_are_gone() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let agent = Arc::new(SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        ));
+        let held = |key: &str| agent.session_locks.lock().unwrap().contains_key(key);
+        let thread = SessionId::new("lock-thread");
+        agent.sessions.lock().unwrap().insert(
+            "lock-thread".into(),
+            agent.session_state(&std::env::temp_dir(), &[]),
+        );
+
+        // An open session keeps its entry between requests.
+        drop(agent.lock_session(&thread).await);
+        assert!(held("lock-thread"));
+
+        // A request naming an id nobody opened leaves nothing behind.
+        drop(agent.lock_session(&SessionId::new("lock-stranger")).await);
+        assert!(!held("lock-stranger"));
+
+        // The session closes with another request queued behind the close.
+        // That request still has to find the same lock, so the entry stays
+        // until it has had its turn.
+        let closing = agent.lock_session(&thread).await;
+        let queued = agent.lock_session(&thread);
+        tokio::pin!(queued);
+        tokio::select! {
+            biased;
+            _ = &mut queued => panic!("the queued request ran beside the one holding the lock"),
+            _ = std::future::ready(()) => {}
+        }
+        agent.sessions.lock().unwrap().remove("lock-thread");
+        drop(closing);
+        assert!(held("lock-thread"));
+        drop(queued.await);
+        assert!(!held("lock-thread"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the lock guards process-global env for the whole test
+    async fn a_turn_whose_session_cannot_be_reinstalled_is_cancelled() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let agent = SiGitAgent::new(
+            Arc::new(ChatEngine::new()),
+            default_local_model_config(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            false,
+            false,
+        );
+        let gone = SessionId::new("resume-thread-gone");
+        let cancellation = PromptCancellation::default();
+        let mut workspace = WorkspaceHold::acquire(&agent.workspace_lock).await;
+
+        // The lock was never given up, so there is nothing to reinstall.
+        agent
+            .resume_workspace(&mut workspace, &gone, &cancellation)
+            .await;
+        assert!(!cancellation.cancelled.load(Ordering::Acquire));
+
+        workspace.release();
+        agent
+            .resume_workspace(&mut workspace, &gone, &cancellation)
+            .await;
+        assert!(cancellation.cancelled.load(Ordering::Acquire));
+        // The signal is there for whatever waits on it next.
+        cancellation.cancelled().await;
+        assert!(agent.active_session.lock().unwrap().is_none());
     }
 
     #[test]

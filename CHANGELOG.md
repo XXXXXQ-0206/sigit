@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A turn that cannot get its session back stops.** A turn on an HTTP backend
+  gives up the process-wide working directory while it waits and reinstalls
+  its session before a tool runs. If the reinstall failed, the turn logged a
+  warning and carried on in whichever directory was current. Nothing makes it
+  fail today, since a close waits for the turn, but the turn now ends as
+  cancelled instead of depending on that.
+
+### Fixed
+
+- **Closing a thread that is waiting at a permission prompt no longer hangs.**
+  `session/close` cancels the session's running turn and waits for it to end,
+  but a turn stopped at a permission prompt only went on when the client
+  answered the request. A client that closed the thread without answering
+  left the close, and every later request for that thread, waiting for good.
+  The same held for `session/cancel` with a client that did not send the
+  cancelled outcome the protocol asks for. The permission wait now ends on
+  the cancellation as well, and an approval that arrives after the turn was
+  cancelled runs nothing.
+
+- **A closed thread no longer leaves its request lock behind.** The process
+  kept one lock per session id for as long as it ran, for closed threads and
+  for ids no session ever had. The entry now goes with the last request that
+  used it.
+
 ## 1.6.4
 
 ### Added
