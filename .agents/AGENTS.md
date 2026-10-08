@@ -163,6 +163,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   when its model cannot read them, which is what makes a mid-thread switch to a text-only tier
   safe. Read history text through `backend::message_text`, never `content.as_str()`.
   `IMAGE_TIERS` mirrors onde-cloud's `IMAGE_CANDIDATES`; update both together.
+  Audio attachments take the same path (`promptCapabilities.audio`, `accepts_audio`,
+  `audio_for_turn`, `without_audio`), sent as OpenAI `input_audio` parts. No cloud tier
+  takes audio, because onde-cloud drops `input_audio` parts when it parses a request, so
+  `provider::model_accepts_audio` says no for every `onde-*` id and yes for a user's own
+  endpoint. If onde-cloud ever routes audio, give it a tier table like `IMAGE_TIERS`.
 - **`src/provider.rs`** — decides *which* backend serves inference. Resolution order, first match
   wins: (1) override via `OPENAI_BASE_URL`+`OPENAI_API_KEY` or active profile in
   `~/.config/sigit/providers.toml`; (2) siGit Code Cloud when logged in; (3) on-device.
