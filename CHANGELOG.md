@@ -28,6 +28,17 @@
 
 ### Fixed
 
+- **Tags a model makes up no longer show in the reply.** After a long run of
+  tool rounds, a model could start writing markup that looked like it came
+  from siGit Code: a `<system_warning>` block telling the user the previous
+  turn was injected and should be ignored, or a question wrapped in
+  `<Option_Picker>`. Neither tag means anything to siGit Code or the editor,
+  so both rendered as raw text. A `system_*` block is now dropped from the
+  reply and from the history, and other made-up tags are removed while the
+  text inside them stays. Code blocks are left alone. The system prompt also
+  tells the model to write plain Markdown and to list choices as plain text
+  (#122).
+
 - **Closing a thread that is waiting at a permission prompt no longer hangs.**
   `session/close` cancels the session's running turn and waits for it to end,
   but a turn stopped at a permission prompt only went on when the client
