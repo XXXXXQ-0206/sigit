@@ -16,6 +16,9 @@
   while siGit Code Cloud tiers and on-device models, none of which take audio
   today, get a note in its place and the editor says the clip was left out
   (#143).
+- **The README says what telemetry is sent.** A new Telemetry section covers
+  the model-timing events Onde Inference can report for on-device models,
+  what they leave out, and how to turn them off with `ONDE_DISABLE_PULSE=1`.
 
 ### Changed
 
