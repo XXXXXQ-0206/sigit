@@ -33,6 +33,7 @@ mod backend;
 mod browser_auth;
 mod chat;
 mod client_fs;
+mod client_terminal;
 mod commands;
 mod credentials;
 mod frontmatter;
@@ -74,21 +75,23 @@ use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
-    ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigValueId, SessionForkCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionMode, SessionModeState, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, WriteTextFileRequest,
+    ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
+    EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse, Implementation,
+    InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta, NewSessionRequest,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
+    ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigValueId,
+    SessionForkCapabilities, SessionId, SessionInfo, SessionListCapabilities, SessionMode,
+    SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, Terminal, TerminalOutputRequest, ToolCall, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    UnstructuredCommandInput, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use onde::inference::{ChatEngine, GgufModelConfig};
@@ -513,6 +516,36 @@ fn tool_output_content(output: &str) -> ToolCallContent {
     fenced_code_block("", &chat::cap_output_preview(output)).into()
 }
 
+/// A file a tool wrote, as ACP `diff` content, which clients render as a real
+/// diff (Zed builds its review UI from it) instead of a line of result text
+/// (issue #145).
+fn file_change_content(change: &tools::FileChange) -> ToolCallContent {
+    Diff::new(change.path.clone(), change.new_text.clone())
+        .old_text(change.old_text.clone())
+        .into()
+}
+
+/// The content of a finished tool call's card: the client terminal the
+/// command ran in, when it ran in one, which already shows its output (the
+/// full result text still travels as `raw_output`); otherwise the diff of the
+/// file it wrote, if it wrote one, then its result text.
+fn tool_result_content(
+    output: &str,
+    change: Option<&tools::FileChange>,
+    terminal: Option<&str>,
+) -> Vec<ToolCallContent> {
+    if let Some(terminal_id) = terminal {
+        return vec![ToolCallContent::Terminal(Terminal::new(
+            terminal_id.to_string(),
+        ))];
+    }
+    change
+        .map(file_change_content)
+        .into_iter()
+        .chain(std::iter::once(tool_output_content(output)))
+        .collect()
+}
+
 /// A single-file location for the path-bearing tools, so ACP clients can
 /// follow the agent through a file as it works (issue #78's "follow-along").
 fn tool_call_locations(name: &str, arguments_json: &str) -> Vec<ToolCallLocation> {
@@ -927,6 +960,113 @@ impl client_fs::ClientFileSystem for AcpClientFs {
                 session_id.to_string(),
                 path,
                 content,
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The editor's terminal, reached over the ACP connection. Registered with
+/// `client_terminal` at `initialize` when the client advertises `terminal`.
+struct AcpClientTerminal {
+    cx: ConnectionTo<Client>,
+}
+
+#[async_trait::async_trait]
+impl client_terminal::ClientTerminal for AcpClientTerminal {
+    async fn create(
+        &self,
+        session_id: &str,
+        command: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        output_byte_limit: u64,
+    ) -> Result<String, String> {
+        self.cx
+            .send_request(
+                CreateTerminalRequest::new(session_id.to_string(), command)
+                    .args(args.to_vec())
+                    .cwd(cwd.to_path_buf())
+                    .output_byte_limit(output_byte_limit),
+            )
+            .block_task()
+            .await
+            .map(|response| response.terminal_id.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn embed(&self, session_id: &str, tool_call_id: &str, terminal_id: &str) {
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id.to_string(),
+            ToolCallUpdateFields::new().content(vec![ToolCallContent::Terminal(Terminal::new(
+                terminal_id.to_string(),
+            ))]),
+        ));
+        if let Err(error) = self
+            .cx
+            .send_notification(SessionNotification::new(session_id.to_string(), update))
+        {
+            log::warn!("could not show terminal {terminal_id} in {tool_call_id}: {error}");
+        }
+    }
+
+    async fn wait_for_exit(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<client_terminal::ExitStatus, String> {
+        self.cx
+            .send_request(WaitForTerminalExitRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|response| client_terminal::ExitStatus {
+                exit_code: response.exit_status.exit_code,
+                signal: response.exit_status.signal,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn output(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<client_terminal::Output, String> {
+        self.cx
+            .send_request(TerminalOutputRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|response| client_terminal::Output {
+                output: response.output,
+                truncated: response.truncated,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    async fn kill(&self, session_id: &str, terminal_id: &str) -> Result<(), String> {
+        self.cx
+            .send_request(KillTerminalRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
+            ))
+            .block_task()
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn release(&self, session_id: &str, terminal_id: &str) -> Result<(), String> {
+        self.cx
+            .send_request(ReleaseTerminalRequest::new(
+                session_id.to_string(),
+                terminal_id.to_string(),
             ))
             .block_task()
             .await
@@ -1956,6 +2096,16 @@ impl SiGitAgent {
                 fs.read_text_file,
                 fs.write_text_file,
             );
+        }
+
+        // Likewise a client with a terminal runs foreground commands in it,
+        // so the user sees them live (see `client_terminal`).
+        let terminal = req.client_capabilities.terminal;
+        if client_terminal::disabled_by_env() {
+            log::info!("client terminal: off (SIGIT_CLIENT_TERMINAL)");
+        } else {
+            log::info!("client terminal: {terminal}");
+            client_terminal::register(Arc::new(AcpClientTerminal { cx: cx.clone() }), terminal);
         }
 
         // Agent-handled auth method. We don't use `AuthMethod::Terminal`: editors
@@ -3334,6 +3484,8 @@ impl SiGitAgent {
                 // mutating tool consults policy and may ask the client. The
                 // flag says whether the tool actually ran: a call that was
                 // denied or skipped ends `failed`, not `completed` (#139).
+                let mut change = None;
+                let mut terminal = None;
                 let (output, executed) = match decision {
                     None => (
                         format!(
@@ -3345,13 +3497,25 @@ impl SiGitAgent {
                     ),
                     Some(decision) => match decision {
                         permissions::Decision::Allow => {
-                            (tools::execute_tool(&tc.name, &tc.arguments).await, true)
+                            let outcome = tools::execute_tool_with_change(
+                                &tc.name,
+                                &tc.arguments,
+                                Some(&tc.id),
+                            )
+                            .await;
+                            change = outcome.change;
+                            terminal = outcome.terminal;
+                            (outcome.output, true)
                         }
                         permissions::Decision::Deny(reason) => {
                             log::info!("  ✗ {} denied by policy", tc.name);
                             (reason, false)
                         }
                         permissions::Decision::Ask => {
+                            // Worked out while the session still holds the
+                            // workspace: a relative path resolves against
+                            // its cwd.
+                            let preview = tools::preview_file_change(&tc.name, &tc.arguments).await;
                             // The answer can take as long as the user likes.
                             if release_while_waiting {
                                 workspace.release();
@@ -3366,6 +3530,7 @@ impl SiGitAgent {
                                     &tc.id,
                                     &tc.name,
                                     &tc.arguments,
+                                    preview.as_ref(),
                                 ) => verdict,
                                 _ = cancellation.cancelled() => PermissionVerdict::TurnCancelled,
                             };
@@ -3400,7 +3565,15 @@ impl SiGitAgent {
                                         )
                                         .ok();
                                     }
-                                    (tools::execute_tool(&tc.name, &tc.arguments).await, true)
+                                    let outcome = tools::execute_tool_with_change(
+                                        &tc.name,
+                                        &tc.arguments,
+                                        Some(&tc.id),
+                                    )
+                                    .await;
+                                    change = outcome.change;
+                                    terminal = outcome.terminal;
+                                    (outcome.output, true)
                                 }
                                 PermissionVerdict::Denied(reason) => {
                                     log::info!("  ✗ {} denied by user", tc.name);
@@ -3462,7 +3635,11 @@ impl SiGitAgent {
                         } else {
                             ToolCallStatus::Failed
                         })
-                        .content(vec![tool_output_content(&output)])
+                        .content(tool_result_content(
+                            &output,
+                            change.as_ref(),
+                            terminal.as_deref(),
+                        ))
                         .raw_output(serde_json::Value::String(output.clone()));
                     // A denial at the prompt leaves the card titled with the
                     // permission request's full arguments; put its own back.
@@ -3660,6 +3837,10 @@ impl SiGitAgent {
     /// recorded via [`permissions::grant_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
     /// dispatch loop must be free to route the client's answer back to us.
+    ///
+    /// `preview` is the file change the call would make, from
+    /// [`tools::preview_file_change`]; when there is one the card shows it as
+    /// a diff, so the user approves an edit by looking at the change.
     async fn request_tool_permission(
         &self,
         cx: &ConnectionTo<Client>,
@@ -3667,6 +3848,7 @@ impl SiGitAgent {
         tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
+        preview: Option<&tools::FileChange>,
     ) -> PermissionVerdict {
         // The user decides from this dialog, so show the arguments with any
         // truncation flagged (a silently clipped command could hide its tail
@@ -3691,6 +3873,7 @@ impl SiGitAgent {
                     .title(title)
                     .kind(tool_kind_for(tool_name))
                     .status(ToolCallStatus::Pending)
+                    .content(preview.map(|change| vec![file_change_content(change)]))
                     .raw_input(raw_input),
             ),
             vec![
@@ -7124,6 +7307,54 @@ mod tests {
         let rendered = format!("{content:?}");
         assert!(!rendered.contains("(no output)"));
         assert!(rendered.contains("   \\n\\t  "));
+    }
+
+    #[test]
+    fn a_file_change_is_sent_as_diff_content_before_the_result() {
+        let change = tools::FileChange {
+            path: PathBuf::from("/repo/src/lib.rs"),
+            old_text: Some("old\n".to_string()),
+            new_text: "new\n".to_string(),
+        };
+        let content = serde_json::to_value(tool_result_content(
+            "Edited file: /repo/src/lib.rs (4 bytes written)",
+            Some(&change),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({
+                "type": "diff",
+                "path": "/repo/src/lib.rs",
+                "oldText": "old\n",
+                "newText": "new\n",
+            })
+        );
+        assert_eq!(content[1]["type"], "content");
+        assert_eq!(content.as_array().unwrap().len(), 2);
+
+        // A created file has no old text; ACP leaves `oldText` out.
+        let created = tools::FileChange {
+            old_text: None,
+            ..change
+        };
+        let diff = serde_json::to_value(file_change_content(&created)).unwrap();
+        assert!(diff.get("oldText").is_none_or(serde_json::Value::is_null));
+
+        // Every other tool keeps the result text alone.
+        // A command that ran in the client's terminal keeps the terminal,
+        // which already shows its output.
+        let ran = serde_json::to_value(tool_result_content("Exit code 0:\nhi", None, Some("t-1")))
+            .unwrap();
+        assert_eq!(
+            ran,
+            serde_json::json!([{ "type": "terminal", "terminalId": "t-1" }])
+        );
+
+        let plain = serde_json::to_value(tool_result_content("ok", None, None)).unwrap();
+        assert_eq!(plain.as_array().unwrap().len(), 1);
+        assert_eq!(plain[0]["type"], "content");
     }
 
     #[test]

@@ -335,7 +335,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `execute_tool_impl` asks `route_for` before it dispatches `read_file`, `create_file`,
   `edit_file` or `multi_edit`. Each of those tools is split into a parse step and a pure
   render/apply step (`ReadFileCall`, `CreateFileCall`, `EditCall`) that the disk path and the
-  client path share, so the model gets the same result text either way. The two capabilities are
+  client path share, so the model gets the same result text either way. The writing tools also
+  hand back the file before and after (`tools::FileChange`, via `execute_tool_with_change`), which
+  `handle_prompt` sends as ACP `diff` content ahead of the result text. A permission request for
+  one of them carries the same diff, worked out by `preview_file_change` without writing anything
+  and before the workspace is released, since a relative path resolves against the session's cwd. The two capabilities are
   independent: a client that only reads still gets its edits written to disk. The disk is the
   fallback throughout: nothing is registered in the TUI or headless modes, a path outside the
   session's roots is not routed, and a request the client fails or leaves unanswered for 30
@@ -343,6 +347,23 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   inside a spawned prompt turn, never from `handle_initialize` itself (deadlock, same as
   permission requests). Existence checks and `create_file`'s parent directories still use the
   disk. `SIGIT_CLIENT_FS=off` turns the routing off. Covered by `tests/acp_client_fs.rs`.
+- **`src/client_terminal.rs`** — `run_command` in the ACP client's terminal. A client that
+  advertises `terminal` in `initialize` runs a foreground command itself (`terminal/create`, with
+  the platform shell as `command` and the whole command line as one argument), and
+  `exec_run_command_via_client` embeds the terminal in the tool call as `terminal` content, so the
+  user watches the output live and can stop the command from the editor. The seam is
+  `client_fs`'s: `handle_initialize` registers `AcpClientTerminal`, and `execute_tool_impl` asks
+  `client_terminal_route` before the blocking path. Embedding needs the tool call's id, which is
+  why `execute_tool_with_change` takes one. What `run_command` promises stays put: the 120 s
+  timeout ends in `terminal/kill`, the output is capped, and `CommitWatch` still amends the
+  co-author trailer, checking HEAD on disk before and after. Background commands stay local
+  (`command_output` and `kill_command` read their pipes), and so does a command whose directory
+  is outside the session's roots, since nothing says the editor's machine can see it. A
+  `terminal/create` the client fails means nothing ran, so the command runs locally; a failure
+  after that is reported as the tool's error instead, because running it again could repeat its
+  effects. The finished card keeps the terminal and drops the result text, which still goes out
+  as `raw_output`. `SIGIT_CLIENT_TERMINAL=off` turns the routing off. Covered by
+  `tests/acp_client_terminal.rs`.
 - **`src/chat.rs`** — the Unix-only ratatui TUI. Loading-spinner phase then chat; uses
   `tokio::select!` to multiplex terminal events with streaming tokens.
 - **`src/headless.rs`** — non-interactive `sigit run` execution for scripts, CI, and Factory
@@ -412,7 +433,8 @@ verbosity with `RUST_LOG`.
 default `https://sigit.si`), `SIGIT_CLOUD_URL`, `SIGIT_CONFIG_DIR` (default `~/.config/sigit`),
 `SIGIT_MODEL`, `SIGIT_MAX_TOOL_ROUNDS` (1 to 500, default 24; the tool-round cap of a
 headless run or an ACP prompt turn), `SIGIT_MCP` (`off` disables MCP), `SIGIT_CLIENT_FS` (`off` keeps the file tools on disk even when the
-ACP client offers `fs/read_text_file` / `fs/write_text_file`), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
+ACP client offers `fs/read_text_file` / `fs/write_text_file`), `SIGIT_CLIENT_TERMINAL` (`off` runs
+`run_command` locally even when the ACP client offers a terminal), `SIGIT_MCP_SMBCLOUD` (`off` drops the baked-in
 smbCloud CLI server), `SIGIT_MCP_OFFICIAL` (`off` drops the baked-in
 server), `SIGIT_PERMISSIONS` (`allow`/`ask`/`deny` — overrides the default permission mode for
 mutating tools; the escape hatch for clients without permission-request support),
