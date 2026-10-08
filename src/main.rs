@@ -94,8 +94,8 @@ use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder}
 use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
-    ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult,
-    ToolSpec, TurnResult,
+    ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, TokenChunk,
+    ToolResult as BackendToolResult, ToolSpec, TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -355,10 +355,21 @@ struct StreamedReply {
     assembled: String,
     /// The visible text already on the wire.
     sent: String,
+    /// The inline-`<think>` reasoning text already on the wire.
+    sent_think: String,
     /// Whether any chunk has been sent, i.e. the client already has a reply.
     streamed_any: bool,
     /// Whether the next visible text should open a new paragraph.
     paragraph_pending: bool,
+}
+
+/// What a streamed fragment newly revealed once `<think>` blocks were split:
+/// visible reply text and/or inline reasoning text, either of which may be
+/// absent for a given chunk.
+#[derive(Default)]
+struct RevealedText {
+    visible: Option<String>,
+    reasoning: Option<String>,
 }
 
 impl StreamedReply {
@@ -369,10 +380,11 @@ impl StreamedReply {
         self.paragraph_pending = self.streamed_any;
     }
 
-    /// Fold one streamed fragment into the reply and return the visible text it
-    /// newly reveals, or `None` when it reveals nothing to show (it landed
-    /// inside a `<think>` block, say).
-    fn push(&mut self, piece: &str) -> Option<String> {
+    /// Fold one streamed fragment into the reply and return the text it newly
+    /// reveals: visible reply text (sent as an agent message) and/or inline
+    /// `<think>` reasoning (sent as an agent thought). Either may be absent when
+    /// the fragment reveals nothing of that kind.
+    fn push(&mut self, piece: &str) -> RevealedText {
         if self.paragraph_pending {
             // A tool round interrupted the prose. Clients concatenate
             // consecutive agent-message chunks into one block, so the new round
@@ -382,7 +394,7 @@ impl StreamedReply {
             // way to the break.
             let piece = piece.trim_start();
             if piece.is_empty() {
-                return None;
+                return RevealedText::default();
             }
             self.assembled.push_str(PARAGRAPH_BREAK);
             self.assembled.push_str(piece);
@@ -391,22 +403,35 @@ impl StreamedReply {
             self.assembled.push_str(piece);
         }
 
-        let (_think, visible) = chat::strip_think_blocks(&self.assembled);
+        let (think, visible) = chat::strip_think_blocks(&self.assembled);
+        let mut revealed = RevealedText::default();
+
         match visible.strip_prefix(self.sent.as_str()) {
             Some(extra) if !extra.is_empty() => {
-                let extra = extra.to_string();
+                revealed.visible = Some(extra.to_string());
                 self.sent = visible;
                 self.streamed_any = true;
-                Some(extra)
             }
             // No new visible text, or the visible prefix changed retroactively
             // (rare, e.g. a late-closing think tag): just resync without
             // resending what's already on the wire.
             _ => {
                 self.sent = visible;
-                None
             }
         }
+
+        match think.strip_prefix(self.sent_think.as_str()) {
+            Some(extra) if !extra.is_empty() => {
+                revealed.reasoning = Some(extra.to_string());
+                self.sent_think = think;
+            }
+            // No new reasoning, or it changed retroactively: resync quietly.
+            _ => {
+                self.sent_think = think;
+            }
+        }
+
+        revealed
     }
 }
 
@@ -1400,6 +1425,20 @@ impl SiGitAgent {
         ))
     }
 
+    /// Stream a fragment of the model's reasoning as a thought chunk. Clients
+    /// render these in a collapsed "thinking" section, separate from the reply.
+    fn send_agent_thought(
+        &self,
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        text: impl Into<String>,
+    ) -> agent_client_protocol::Result<()> {
+        cx.send_notification(SessionNotification::new(
+            session_id,
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(text.into()))),
+        ))
+    }
+
     fn send_system_status(
         &self,
         cx: &ConnectionTo<Client>,
@@ -1430,7 +1469,7 @@ impl SiGitAgent {
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
         fut: F,
-        sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        sink_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TokenChunk>,
         reply: &mut StreamedReply,
         cancellation: &PromptCancellation,
     ) -> Result<TurnResult, DrainTurnError>
@@ -1450,30 +1489,45 @@ impl SiGitAgent {
                         break Err(DrainTurnError::Cancelled);
                     }
                 }
-                Some(piece) = sink_rx.recv() => {
-                    self.emit_visible_chunk(cx, session_id, &piece, reply);
+                Some(chunk) = sink_rx.recv() => {
+                    self.emit_token_chunk(cx, session_id, chunk, reply);
                 }
             }
         };
         // Flush tokens that landed between the last poll and the future resolving.
-        while let Ok(piece) = sink_rx.try_recv() {
-            self.emit_visible_chunk(cx, session_id, &piece, reply);
+        while let Ok(chunk) = sink_rx.try_recv() {
+            self.emit_token_chunk(cx, session_id, chunk, reply);
         }
         result
     }
 
-    /// Fold a streamed fragment into `reply` and send whatever it newly reveals
-    /// as an agent-message chunk.
-    fn emit_visible_chunk(
+    /// Route one streamed token chunk. A `Reasoning` chunk comes from a
+    /// dedicated reasoning field and is unambiguous, so it goes straight to the
+    /// client as a thought. A `Visible` chunk is folded into `reply`, which may
+    /// reveal visible reply text (sent as an agent message) and/or inline
+    /// `<think>` reasoning (sent as a thought).
+    fn emit_token_chunk(
         &self,
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
-        piece: &str,
+        chunk: TokenChunk,
         reply: &mut StreamedReply,
     ) {
-        if let Some(extra) = reply.push(piece) {
-            self.send_assistant_message(cx, session_id.clone(), extra)
-                .ok();
+        match chunk {
+            TokenChunk::Reasoning(text) => {
+                self.send_agent_thought(cx, session_id.clone(), text).ok();
+            }
+            TokenChunk::Visible(piece) => {
+                let revealed = reply.push(&piece);
+                if let Some(reasoning) = revealed.reasoning {
+                    self.send_agent_thought(cx, session_id.clone(), reasoning)
+                        .ok();
+                }
+                if let Some(visible) = revealed.visible {
+                    self.send_assistant_message(cx, session_id.clone(), visible)
+                        .ok();
+                }
+            }
         }
     }
 
@@ -3003,10 +3057,11 @@ impl SiGitAgent {
 
         // Token sink: backends stream assistant text through this while a turn
         // runs. We forward the visible portion to the editor as agent-message
-        // chunks live (see `drain_turn` / `emit_visible_chunk`). The sink stays
-        // alive for the whole prompt so `recv()` only ends when a turn future
-        // resolves, never because every sender was dropped.
-        let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // chunks live, and the reasoning portion as thought chunks (see
+        // `drain_turn` / `emit_token_chunk`). The sink stays alive for the whole
+        // prompt so `recv()` only ends when a turn future resolves, never
+        // because every sender was dropped.
+        let (sink, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<TokenChunk>();
         let mut reply = StreamedReply::default();
         let mut repeated_tool_calls = std::collections::HashMap::<String, usize>::new();
 
@@ -6757,8 +6812,8 @@ mod tests {
     #[test]
     fn streamed_reply_sends_each_fragment_as_it_is_revealed() {
         let mut reply = StreamedReply::default();
-        assert_eq!(reply.push("Hello"), Some("Hello".to_string()));
-        assert_eq!(reply.push(", world"), Some(", world".to_string()));
+        assert_eq!(reply.push("Hello").visible, Some("Hello".to_string()));
+        assert_eq!(reply.push(", world").visible, Some(", world".to_string()));
         assert!(reply.streamed_any);
     }
 
@@ -6771,12 +6826,15 @@ mod tests {
         reply.interrupt();
 
         assert_eq!(
-            reply.push("Let me broaden the search:"),
+            reply.push("Let me broaden the search:").visible,
             Some("\n\nLet me broaden the search:".to_string()),
             "the new round must not run onto the end of the last sentence"
         );
         // Only the seam gets a break; the rest of the round streams as usual.
-        assert_eq!(reply.push(" Found them."), Some(" Found them.".to_string()));
+        assert_eq!(
+            reply.push(" Found them.").visible,
+            Some(" Found them.".to_string())
+        );
     }
 
     #[test]
@@ -6787,9 +6845,9 @@ mod tests {
 
         // A fragment of pure whitespace reveals nothing and must not consume
         // the pending break.
-        assert_eq!(reply.push("\n"), None);
+        assert_eq!(reply.push("\n").visible, None);
         assert_eq!(
-            reply.push("  Done."),
+            reply.push("  Done.").visible,
             Some("\n\nDone.".to_string()),
             "the break replaces the model's leading whitespace"
         );
@@ -6802,24 +6860,47 @@ mod tests {
         let mut reply = StreamedReply::default();
         reply.interrupt();
 
-        assert_eq!(reply.push("Found them."), Some("Found them.".to_string()));
+        assert_eq!(
+            reply.push("Found them.").visible,
+            Some("Found them.".to_string())
+        );
     }
 
     #[test]
-    fn streamed_reply_hides_reasoning_and_still_breaks_the_paragraph() {
+    fn streamed_reply_keeps_reasoning_out_of_the_reply_and_still_breaks_the_paragraph() {
         let mut reply = StreamedReply::default();
         reply.push("Looking now.");
         reply.interrupt();
 
-        // A round that opens with reasoning reveals nothing until the visible
-        // text arrives — and that text still starts the new paragraph.
-        assert_eq!(reply.push("<think>weigh"), None);
-        assert_eq!(reply.push(" options</think>"), None);
+        // A round that opens with reasoning reveals no *visible* text until the
+        // reply arrives — and that text still starts the new paragraph.
+        assert_eq!(reply.push("<think>weigh").visible, None);
+        assert_eq!(reply.push(" options</think>").visible, None);
         assert_eq!(
-            reply.push("Here it is."),
+            reply.push("Here it is.").visible,
             Some("\n\nHere it is.".to_string()),
             "the break waits for the reasoning to end and rides out with the text"
         );
+    }
+
+    #[test]
+    fn streamed_reply_surfaces_inline_think_reasoning_incrementally() {
+        let mut reply = StreamedReply::default();
+
+        // Inline `<think>` content is routed as reasoning, not reply text, and
+        // only the newly-revealed suffix is emitted each time.
+        let r = reply.push("<think>weigh");
+        assert_eq!(r.visible, None);
+        assert_eq!(r.reasoning, Some("weigh".to_string()));
+
+        let r = reply.push(" options</think>");
+        assert_eq!(r.visible, None);
+        assert_eq!(r.reasoning, Some(" options".to_string()));
+
+        // The visible answer carries no reasoning.
+        let r = reply.push("Here it is.");
+        assert_eq!(r.visible, Some("Here it is.".to_string()));
+        assert_eq!(r.reasoning, None);
     }
 
     #[test]
