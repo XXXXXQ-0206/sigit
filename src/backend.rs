@@ -321,14 +321,35 @@ pub fn message_audio_count(message: &serde_json::Value) -> usize {
     message_part_count(message, "input_audio")
 }
 
-/// A sink for streaming assistant text deltas to the UI as they are produced.
+/// One streamed fragment, tagged by whether it is visible prose or the model's
+/// reasoning.
+///
+/// Reasoning reaches a backend two ways: inline `<think>…</think>` tags inside
+/// the ordinary content stream (local models, and some OpenAI-compatible
+/// endpoints), or a separate `reasoning_content` delta field (DeepSeek-style
+/// endpoints). Inline tags can't be classified at the source — a tag may span
+/// chunk boundaries — so they travel as [`TokenChunk::Visible`] and are split
+/// out downstream by `StreamedReply`. The `reasoning_content` field *is*
+/// unambiguous at the source, so the backend tags it [`TokenChunk::Reasoning`]
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenChunk {
+    /// Content-stream text. May still contain inline `<think>` tags that a
+    /// downstream consumer splits into reasoning and prose.
+    Visible(String),
+    /// Text from a dedicated reasoning channel, already known to be reasoning.
+    Reasoning(String),
+}
+
+/// A sink for streaming assistant fragments to the UI as they are produced.
 ///
 /// When a caller passes `Some(sink)`, a streaming-capable backend forwards each
-/// text fragment through it as the model emits it; the returned [`TurnResult`]
-/// still carries the fully assembled text (and any tool calls). When the sink is
-/// `None`, the backend runs in non-streaming mode. Unbounded so the inference
-/// task never blocks on a slow consumer.
-pub type TokenSink = tokio::sync::mpsc::UnboundedSender<String>;
+/// fragment through it as the model emits it, tagged [`TokenChunk::Visible`] or
+/// [`TokenChunk::Reasoning`]; the returned [`TurnResult`] still carries the
+/// fully assembled (visible) text and any tool calls. When the sink is `None`,
+/// the backend runs in non-streaming mode. Unbounded so the inference task
+/// never blocks on a slow consumer.
+pub type TokenSink = tokio::sync::mpsc::UnboundedSender<TokenChunk>;
 
 /// An image attached to a user message: base64 data and its media type, as an
 /// ACP client sends it.
@@ -870,7 +891,9 @@ async fn drain_onde_stream(
             text.push_str(&chunk.delta);
             // The receiver is the UI; if it's gone the turn is being cancelled,
             // so stop assembling rather than spinning the model to completion.
-            if sink.send(chunk.delta).is_err() {
+            // onde reports reasoning as inline `<think>` tags in `delta`, so it
+            // is visible content that a downstream consumer splits out.
+            if sink.send(TokenChunk::Visible(chunk.delta)).is_err() {
                 break;
             }
         }
@@ -1010,7 +1033,7 @@ impl OpenAiBackend {
         {
             // The retry's text follows what already streamed; keep it from
             // running on into the previous sentence.
-            let _ = sink.send("\n\n".to_string());
+            let _ = sink.send(TokenChunk::Visible("\n\n".to_string()));
         }
         let (retry, retry_malformed) = self.request(tools, allow_tool_calls, sink).await?;
         if retry_malformed > 0 && retry.tool_calls.is_empty() {
@@ -1390,6 +1413,17 @@ impl OpenAiBackend {
                 if let Some(reason) = choice.finish_reason.as_deref() {
                     finish = FinishReason::from_wire(Some(reason));
                 }
+                // Reasoning streamed in its own field is tagged at the source;
+                // it bypasses the inline-tag scanner and is never kept in the
+                // assistant message text.
+                if let Some(reasoning) = choice.delta.reasoning_content
+                    && !reasoning.is_empty()
+                    && sink.send(TokenChunk::Reasoning(reasoning)).is_err()
+                {
+                    // Consumer dropped (turn cancelled).
+                    done = true;
+                    break;
+                }
                 if let Some(content) = choice.delta.content
                     && !content.is_empty()
                 {
@@ -1398,7 +1432,7 @@ impl OpenAiBackend {
                         match event {
                             crate::inline_tool_calls::ScanEvent::Text(chunk) => {
                                 text.push_str(&chunk);
-                                if sink.send(chunk).is_err() {
+                                if sink.send(TokenChunk::Visible(chunk)).is_err() {
                                     // Consumer dropped (turn cancelled).
                                     cancelled = true;
                                     break;
@@ -1459,7 +1493,7 @@ impl OpenAiBackend {
         match scanner.finish() {
             Some(crate::inline_tool_calls::ScanEvent::Text(leftover)) => {
                 text.push_str(&leftover);
-                let _ = sink.send(leftover);
+                let _ = sink.send(TokenChunk::Visible(leftover));
             }
             Some(crate::inline_tool_calls::ScanEvent::Malformed(block)) => {
                 log_malformed_block(&block);
@@ -1989,6 +2023,11 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    // Some endpoints stream model reasoning in a dedicated field rather than
+    // inline `<think>` tags. It is unambiguously reasoning at the source, so it
+    // travels as `TokenChunk::Reasoning` and never enters the content scanner.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
 }
