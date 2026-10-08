@@ -94,8 +94,8 @@ use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder}
 use onde::inference::{ChatEngine, GgufModelConfig};
 
 use crate::backend::{
-    ImageInput, InferenceBackend, LocalBackend, OpenAiBackend, ToolResult as BackendToolResult,
-    ToolSpec, TurnResult,
+    AudioInput, ImageInput, InferenceBackend, LocalBackend, OpenAiBackend,
+    ToolResult as BackendToolResult, ToolSpec, TurnResult,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1706,70 +1706,154 @@ impl SiGitAgent {
 /// the note about a model switch is shown once and not on every prompt.
 static IMAGE_GAP_NOTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
-/// Decide what happens to a prompt's images for the model about to answer.
+/// The same for earlier audio clips.
+static AUDIO_GAP_NOTED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The wording [`attachments_for_turn`] uses for one kind of attachment.
+struct AttachmentKind {
+    /// "image"
+    noun: &'static str,
+    /// "images"
+    nouns: &'static str,
+    /// "Image", for the notice headings.
+    heading: &'static str,
+    /// "Images", for the notice headings.
+    headings: &'static str,
+    /// "read images"
+    ability: &'static str,
+    /// Where the user can find a model that can.
+    hint: &'static str,
+    /// Session and model pairs already told about earlier attachments.
+    noted: &'static std::sync::Mutex<Vec<(String, String)>>,
+}
+
+const IMAGES: AttachmentKind = AttachmentKind {
+    noun: "image",
+    nouns: "images",
+    heading: "Image",
+    headings: "images",
+    ability: "read images",
+    hint: "Models marked \"reads images\" in the model picker can.",
+    noted: &IMAGE_GAP_NOTED,
+};
+
+const AUDIO: AttachmentKind = AttachmentKind {
+    noun: "audio clip",
+    nouns: "audio clips",
+    heading: "Audio",
+    headings: "audio clips",
+    ability: "take audio",
+    hint: "No siGit Code Cloud or on-device model can; a model on an endpoint you \
+           configure yourself can, if it accepts audio input.",
+    noted: &AUDIO_GAP_NOTED,
+};
+
+/// Decide what happens to a prompt's attachments of one `kind` for the model
+/// about to answer.
 ///
-/// The editor can attach an image whatever model is selected, because ACP
-/// fixes `promptCapabilities.image` for the whole connection. Returns the text
-/// and images to send, plus a note for the user when something is being left
-/// out:
+/// The editor can attach images and audio whatever model is selected, because
+/// ACP fixes `promptCapabilities` for the whole connection. Returns the text
+/// and attachments to send, plus a note for the user when something is being
+/// left out:
 ///
-/// - the model cannot read images and the prompt has some: they are dropped,
+/// - the model cannot take them and the prompt has some: they are dropped,
 ///   the user is told, and the model is told too, so it does not answer as if
 ///   it had seen them;
-/// - the model cannot read images and the thread has some from before a model
-///   switch (`earlier_images`): the user is told once per session and model.
-fn images_for_turn(
+/// - the model cannot take them and the thread has some from before a model
+///   switch (`earlier`): the user is told once per session and model.
+fn attachments_for_turn<T>(
     mut user_text: String,
+    attachments: Vec<T>,
+    accepts: bool,
+    model_name: &str,
+    earlier: usize,
+    session_id: &str,
+    kind: &AttachmentKind,
+) -> (String, Vec<T>, Option<String>) {
+    if accepts {
+        return (user_text, attachments, None);
+    }
+
+    let nouns = |count: usize| if count == 1 { kind.noun } else { kind.nouns };
+    let ability = kind.ability;
+    let hint = kind.hint;
+
+    if !attachments.is_empty() {
+        let count = attachments.len();
+        if !user_text.is_empty() {
+            user_text.push_str("\n\n");
+        }
+        user_text.push_str(&format!(
+            "[The user attached {count} {}. This model cannot {ability}, so it was not \
+             included. Say so if the request depends on it.]",
+            nouns(count)
+        ));
+        let notice = format!(
+            "> **{} not sent.** {model_name} cannot {ability}, so the {count} attached {} {} \
+             left out of this message. {hint}",
+            kind.heading,
+            nouns(count),
+            if count == 1 { "was" } else { "were" }
+        );
+        return (user_text, Vec::new(), Some(notice));
+    }
+
+    if earlier > 0 {
+        let key = (session_id.to_string(), model_name.to_string());
+        let mut noted = kind.noted.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(&key) {
+            noted.push(key);
+            let notice = format!(
+                "> **Earlier {} are hidden.** {model_name} cannot {ability}, so the \
+                 {earlier} {} attached earlier in this thread {} not sent to it. {hint}",
+                kind.headings,
+                nouns(earlier),
+                if earlier == 1 { "is" } else { "are" }
+            );
+            return (user_text, attachments, Some(notice));
+        }
+    }
+    (user_text, attachments, None)
+}
+
+/// [`attachments_for_turn`] for a prompt's images.
+fn images_for_turn(
+    user_text: String,
     images: Vec<ImageInput>,
     accepts_images: bool,
     model_name: &str,
     earlier_images: usize,
     session_id: &str,
 ) -> (String, Vec<ImageInput>, Option<String>) {
-    if accepts_images {
-        return (user_text, images, None);
-    }
+    attachments_for_turn(
+        user_text,
+        images,
+        accepts_images,
+        model_name,
+        earlier_images,
+        session_id,
+        &IMAGES,
+    )
+}
 
-    const HINT: &str = "Models marked \"reads images\" in the model picker can.";
-    let plural = |count: usize| if count == 1 { "image" } else { "images" };
-
-    if !images.is_empty() {
-        let count = images.len();
-        if !user_text.is_empty() {
-            user_text.push_str("\n\n");
-        }
-        user_text.push_str(&format!(
-            "[The user attached {count} {}. This model cannot read images, so it was not \
-             included. Say so if the request depends on it.]",
-            plural(count)
-        ));
-        let notice = format!(
-            "> **Image not sent.** {model_name} cannot read images, so the {count} attached {} \
-             left out of this message. {HINT}",
-            if count == 1 {
-                "image was"
-            } else {
-                "images were"
-            }
-        );
-        return (user_text, Vec::new(), Some(notice));
-    }
-
-    if earlier_images > 0 {
-        let key = (session_id.to_string(), model_name.to_string());
-        let mut noted = IMAGE_GAP_NOTED.lock().unwrap_or_else(|e| e.into_inner());
-        if !noted.contains(&key) {
-            noted.push(key);
-            let notice = format!(
-                "> **Earlier images are hidden.** {model_name} cannot read images, so the \
-                 {earlier_images} {} attached earlier in this thread {} not sent to it. {HINT}",
-                plural(earlier_images),
-                if earlier_images == 1 { "is" } else { "are" }
-            );
-            return (user_text, images, Some(notice));
-        }
-    }
-    (user_text, images, None)
+/// [`attachments_for_turn`] for a prompt's audio clips.
+fn audio_for_turn(
+    user_text: String,
+    audio: Vec<AudioInput>,
+    accepts_audio: bool,
+    model_name: &str,
+    earlier_audio: usize,
+    session_id: &str,
+) -> (String, Vec<AudioInput>, Option<String>) {
+    attachments_for_turn(
+        user_text,
+        audio,
+        accepts_audio,
+        model_name,
+        earlier_audio,
+        session_id,
+        &AUDIO,
+    )
 }
 
 /// The servers out of a session request's `mcpServers` that siGit Code can
@@ -1905,8 +1989,15 @@ impl SiGitAgent {
                     // contents, e.g. an `@file` mention with unsaved edits.
                     // Without it a client sends only a `resource_link`, and
                     // sigit reads the file from disk.
+                    //
+                    // Audio works the way images do. No cloud tier or on-device
+                    // model takes it today, so in practice only a model on the
+                    // user's own endpoint receives it (see `audio_for_turn`).
                     .prompt_capabilities(
-                        PromptCapabilities::new().image(true).embedded_context(true),
+                        PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
                     )
                     // Clients only pass HTTP MCP servers in `mcpServers` to an
                     // agent that says it can reach them. SSE stays off: the
@@ -2812,6 +2903,7 @@ impl SiGitAgent {
 
         let mut parts: Vec<String> = Vec::new();
         let mut images: Vec<ImageInput> = Vec::new();
+        let mut audio: Vec<AudioInput> = Vec::new();
 
         for block in &args.prompt {
             match block {
@@ -2822,6 +2914,12 @@ impl SiGitAgent {
                     images.push(ImageInput {
                         mime_type: image.mime_type.clone(),
                         data: image.data.clone(),
+                    });
+                }
+                ContentBlock::Audio(clip) => {
+                    audio.push(AudioInput {
+                        mime_type: clip.mime_type.clone(),
+                        data: clip.data.clone(),
                     });
                 }
                 ContentBlock::Resource(embedded) => {
@@ -2991,7 +3089,7 @@ impl SiGitAgent {
                 .map(backend::message_image_count)
                 .sum()
         };
-        let (user_text, images, notice) = images_for_turn(
+        let (user_text, images, image_notice) = images_for_turn(
             user_text,
             images,
             backend.accepts_images(),
@@ -2999,7 +3097,25 @@ impl SiGitAgent {
             earlier_images,
             &session_id.to_string(),
         );
-        if let Some(notice) = notice {
+        let earlier_audio = if backend.accepts_audio() {
+            0
+        } else {
+            backend
+                .history_snapshot()
+                .await
+                .iter()
+                .map(backend::message_audio_count)
+                .sum()
+        };
+        let (user_text, audio, audio_notice) = audio_for_turn(
+            user_text,
+            audio,
+            backend.accepts_audio(),
+            &model_name,
+            earlier_audio,
+            &session_id.to_string(),
+        );
+        for notice in [image_notice, audio_notice].into_iter().flatten() {
             self.send_assistant_message(
                 cx,
                 session_id.clone(),
@@ -3033,7 +3149,13 @@ impl SiGitAgent {
             .drain_turn(
                 cx,
                 &session_id,
-                backend.send_message_with_images(&user_text, &images, &tools, Some(&sink)),
+                backend.send_message_with_attachments(
+                    &user_text,
+                    &images,
+                    &audio,
+                    &tools,
+                    Some(&sink),
+                ),
                 &mut sink_rx,
                 &mut reply,
                 &cancellation,
@@ -7089,6 +7211,33 @@ mod tests {
             again.is_none(),
             "the note is shown once, not on every prompt"
         );
+    }
+
+    #[test]
+    fn a_model_without_audio_gets_a_note_and_the_user_is_told() {
+        let clip = AudioInput {
+            mime_type: "audio/wav".to_string(),
+            data: "AAAA".to_string(),
+        };
+        let (text, audio, notice) = audio_for_turn(
+            "listen".to_string(),
+            vec![clip],
+            false,
+            "Nova",
+            0,
+            "s-audio",
+        );
+        assert!(audio.is_empty());
+        assert!(
+            text.starts_with("listen\n\n[The user attached 1 audio clip."),
+            "{text}"
+        );
+        let notice = notice.expect("the user must be told the audio was left out");
+        assert!(
+            notice.starts_with("> **Audio not sent.** Nova cannot take audio"),
+            "{notice}"
+        );
+        assert!(notice.contains("1 attached audio clip was"), "{notice}");
     }
 
     #[test]

@@ -9,6 +9,13 @@
   contents in the prompt instead of sending a link to it. Before, a client
   that follows the spec only sent `resource_link`, and siGit Code read the
   file from disk, missing whatever the user had not saved yet (#141).
+- **A prompt can carry audio.** siGit Code now advertises
+  `promptCapabilities.audio` and sends an attached clip to the model as an
+  OpenAI `input_audio` part. It works the way image attachments do: a model on
+  an endpoint you configure yourself gets the clip and decides for itself,
+  while siGit Code Cloud tiers and on-device models, none of which take audio
+  today, get a note in its place and the editor says the clip was left out
+  (#143).
 
 ### Changed
 
