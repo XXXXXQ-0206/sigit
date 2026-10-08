@@ -182,6 +182,11 @@ siGit Code doesn't set a machine identifier, so every install reports as the sam
 `onde-unknown` edge, and it sends no location. Models you run through siGit Code Cloud or your
 own endpoint send no Onde events.
 
+To see whether your build reports, load an on-device model and check the log for
+`ChatEngine: pulse telemetry enabled` or `ChatEngine: pulse telemetry disabled`. siGit Code logs
+to stderr, which an editor shows in its agent log. Terminal mode writes it to
+`$TMPDIR/sigit.log`.
+
 To turn it off, set `ONDE_DISABLE_PULSE=1` in the environment siGit Code runs in. For an
 editor, put it in the agent's `env` block:
 
