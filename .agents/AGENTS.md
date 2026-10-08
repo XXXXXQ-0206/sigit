@@ -330,7 +330,11 @@ feeds results back. Neither the loop nor ACP/TUI surfaces depend on a concrete b
   `execute_tool_impl` asks `route_for` before it dispatches `read_file`, `create_file`,
   `edit_file` or `multi_edit`. Each of those tools is split into a parse step and a pure
   render/apply step (`ReadFileCall`, `CreateFileCall`, `EditCall`) that the disk path and the
-  client path share, so the model gets the same result text either way. The two capabilities are
+  client path share, so the model gets the same result text either way. The writing tools also
+  hand back the file before and after (`tools::FileChange`, via `execute_tool_with_change`), which
+  `handle_prompt` sends as ACP `diff` content ahead of the result text. A permission request for
+  one of them carries the same diff, worked out by `preview_file_change` without writing anything
+  and before the workspace is released, since a relative path resolves against the session's cwd. The two capabilities are
   independent: a client that only reads still gets its edits written to disk. The disk is the
   fallback throughout: nothing is registered in the TUI or headless modes, a path outside the
   session's roots is not routed, and a request the client fails or leaves unanswered for 30

@@ -74,8 +74,8 @@ use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     CancelNotification, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
-    ContentBlock, ContentChunk, CurrentModeUpdate, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ContentBlock, ContentChunk, CurrentModeUpdate, Diff, EmbeddedResourceResource,
+    ForkSessionRequest, ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     LogoutCapabilities, LogoutRequest, LogoutResponse, McpCapabilities, McpServer, Meta,
     NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
@@ -511,6 +511,25 @@ fn tool_output_content(output: &str) -> ToolCallContent {
         return "(no output)".to_string().into();
     }
     fenced_code_block("", &chat::cap_output_preview(output)).into()
+}
+
+/// A file a tool wrote, as ACP `diff` content, which clients render as a real
+/// diff (Zed builds its review UI from it) instead of a line of result text
+/// (issue #145).
+fn file_change_content(change: &tools::FileChange) -> ToolCallContent {
+    Diff::new(change.path.clone(), change.new_text.clone())
+        .old_text(change.old_text.clone())
+        .into()
+}
+
+/// The content of a finished tool call's card: the diff of the file it wrote,
+/// if it wrote one, then its result text.
+fn tool_result_content(output: &str, change: Option<&tools::FileChange>) -> Vec<ToolCallContent> {
+    change
+        .map(file_change_content)
+        .into_iter()
+        .chain(std::iter::once(tool_output_content(output)))
+        .collect()
 }
 
 /// A single-file location for the path-bearing tools, so ACP clients can
@@ -3203,6 +3222,7 @@ impl SiGitAgent {
 
                 // Permission gate: read-only tools pass straight through; a
                 // mutating tool consults policy and may ask the client.
+                let mut change = None;
                 let output = match decision {
                     None => format!(
                         "The tool `{}` was not executed again because the model repeated \
@@ -3211,13 +3231,20 @@ impl SiGitAgent {
                     ),
                     Some(decision) => match decision {
                         permissions::Decision::Allow => {
-                            tools::execute_tool(&tc.name, &tc.arguments).await
+                            let outcome =
+                                tools::execute_tool_with_change(&tc.name, &tc.arguments).await;
+                            change = outcome.change;
+                            outcome.output
                         }
                         permissions::Decision::Deny(reason) => {
                             log::info!("  ✗ {} denied by policy", tc.name);
                             reason
                         }
                         permissions::Decision::Ask => {
+                            // Worked out while the session still holds the
+                            // workspace: a relative path resolves against
+                            // its cwd.
+                            let preview = tools::preview_file_change(&tc.name, &tc.arguments).await;
                             // The answer can take as long as the user likes.
                             if release_while_waiting {
                                 workspace.release();
@@ -3232,6 +3259,7 @@ impl SiGitAgent {
                                     &tc.id,
                                     &tc.name,
                                     &tc.arguments,
+                                    preview.as_ref(),
                                 ) => verdict,
                                 _ = cancellation.cancelled() => PermissionVerdict::TurnCancelled,
                             };
@@ -3266,7 +3294,11 @@ impl SiGitAgent {
                                         )
                                         .ok();
                                     }
-                                    tools::execute_tool(&tc.name, &tc.arguments).await
+                                    let outcome =
+                                        tools::execute_tool_with_change(&tc.name, &tc.arguments)
+                                            .await;
+                                    change = outcome.change;
+                                    outcome.output
                                 }
                                 PermissionVerdict::Denied(reason) => {
                                     log::info!("  ✗ {} denied by user", tc.name);
@@ -3329,7 +3361,7 @@ impl SiGitAgent {
                             tc.id.clone(),
                             ToolCallUpdateFields::new()
                                 .status(ToolCallStatus::Completed)
-                                .content(vec![tool_output_content(&output)])
+                                .content(tool_result_content(&output, change.as_ref()))
                                 .raw_output(serde_json::Value::String(output.clone())),
                         )),
                     )
@@ -3519,6 +3551,10 @@ impl SiGitAgent {
     /// recorded via [`permissions::grant_for_session`]. Only safe to call from
     /// a spawned task (see the handler registration in `run_acp_server`): the
     /// dispatch loop must be free to route the client's answer back to us.
+    ///
+    /// `preview` is the file change the call would make, from
+    /// [`tools::preview_file_change`]; when there is one the card shows it as
+    /// a diff, so the user approves an edit by looking at the change.
     async fn request_tool_permission(
         &self,
         cx: &ConnectionTo<Client>,
@@ -3526,6 +3562,7 @@ impl SiGitAgent {
         tool_call_id: &str,
         tool_name: &str,
         arguments: &str,
+        preview: Option<&tools::FileChange>,
     ) -> PermissionVerdict {
         // The user decides from this dialog, so show the arguments with any
         // truncation flagged (a silently clipped command could hide its tail
@@ -3550,6 +3587,7 @@ impl SiGitAgent {
                     .title(title)
                     .kind(tool_kind_for(tool_name))
                     .status(ToolCallStatus::Pending)
+                    .content(preview.map(|change| vec![file_change_content(change)]))
                     .raw_input(raw_input),
             ),
             vec![
@@ -6983,6 +7021,44 @@ mod tests {
         let rendered = format!("{content:?}");
         assert!(!rendered.contains("(no output)"));
         assert!(rendered.contains("   \\n\\t  "));
+    }
+
+    #[test]
+    fn a_file_change_is_sent_as_diff_content_before_the_result() {
+        let change = tools::FileChange {
+            path: PathBuf::from("/repo/src/lib.rs"),
+            old_text: Some("old\n".to_string()),
+            new_text: "new\n".to_string(),
+        };
+        let content = serde_json::to_value(tool_result_content(
+            "Edited file: /repo/src/lib.rs (4 bytes written)",
+            Some(&change),
+        ))
+        .unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({
+                "type": "diff",
+                "path": "/repo/src/lib.rs",
+                "oldText": "old\n",
+                "newText": "new\n",
+            })
+        );
+        assert_eq!(content[1]["type"], "content");
+        assert_eq!(content.as_array().unwrap().len(), 2);
+
+        // A created file has no old text; ACP leaves `oldText` out.
+        let created = tools::FileChange {
+            old_text: None,
+            ..change
+        };
+        let diff = serde_json::to_value(file_change_content(&created)).unwrap();
+        assert!(diff.get("oldText").is_none_or(serde_json::Value::is_null));
+
+        // Every other tool keeps the result text alone.
+        let plain = serde_json::to_value(tool_result_content("ok", None)).unwrap();
+        assert_eq!(plain.as_array().unwrap().len(), 1);
+        assert_eq!(plain[0]["type"], "content");
     }
 
     #[test]

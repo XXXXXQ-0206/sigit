@@ -437,7 +437,40 @@ pub fn all_tools() -> Vec<AgentTool> {
 
 // ── Tool execution ───────────────────────────────────────────────────────────
 
+/// A file a tool call wrote, before and after, so an ACP client can show the
+/// change as a diff instead of the result text (`ToolCallContent::Diff`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileChange {
+    /// Absolute, as ACP requires.
+    pub path: PathBuf,
+    /// `None` for a file the call created.
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
+/// What a tool call produced: the result text the model sees and, for the
+/// file-writing tools, the change it made.
+#[derive(Debug)]
+pub struct ToolOutcome {
+    pub output: String,
+    pub change: Option<FileChange>,
+}
+
+impl From<String> for ToolOutcome {
+    fn from(output: String) -> Self {
+        Self {
+            output,
+            change: None,
+        }
+    }
+}
+
 pub async fn execute_tool(name: &str, arguments: &str) -> String {
+    execute_tool_with_change(name, arguments).await.output
+}
+
+/// [`execute_tool`], keeping the file change for the surfaces that render it.
+pub async fn execute_tool_with_change(name: &str, arguments: &str) -> ToolOutcome {
     // Settings are read once per call (not once per hook phase) so a
     // deployment without any [hooks] configured pays one cheap TOML parse
     // per tool call rather than two.
@@ -455,13 +488,13 @@ pub async fn execute_tool(name: &str, arguments: &str) -> String {
     if let Some(cwd) = &cwd
         && !hook_settings.post_tool_use.is_empty()
     {
-        crate::hooks::run_post_tool_use_hooks(&hook_settings, name, &result, cwd);
+        crate::hooks::run_post_tool_use_hooks(&hook_settings, name, &result.output, cwd);
     }
 
     result
 }
 
-async fn execute_tool_impl(name: &str, arguments: &str) -> String {
+async fn execute_tool_impl(name: &str, arguments: &str) -> ToolOutcome {
     // An editor that serves files from its buffers gets the file tools' reads
     // and writes for paths in the session's roots (see `client_fs`).
     if let Some(route) = client_file_route(name, arguments) {
@@ -469,12 +502,14 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
     }
 
     match name {
-        TASK_TOOL_NAME => exec_task(arguments).await,
-        WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await,
-        "command_output" => exec_command_output_wait(arguments, active_session()).await,
+        TASK_TOOL_NAME => exec_task(arguments).await.into(),
+        WEB_SEARCH_TOOL_NAME => exec_web_search(arguments).await.into(),
+        "command_output" => exec_command_output_wait(arguments, active_session())
+            .await
+            .into(),
         // Tools discovered from MCP servers are namespaced `mcp__<server>__<tool>`
         // and forwarded to the owning server.
-        _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await,
+        _ if crate::mcp::is_mcp_tool(name) => crate::mcp::call_tool(name, arguments).await.into(),
         // Everything else is synchronous and may run for a long time: a shell
         // command up to COMMAND_TIMEOUT, a glob over a big tree, an HTTP fetch
         // on reqwest::blocking (which panics if polled on a runtime thread).
@@ -500,7 +535,7 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
             // tool result, not the whole turn. Note this is strictly safer
             // than running the tool inline, where the panic would unwind
             // through the turn and take the ACP connection with it.
-            .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}"))
+            .unwrap_or_else(|err| format!("Error: {tool} task failed: {err}").into())
         }
     }
 }
@@ -514,16 +549,15 @@ async fn execute_tool_impl(name: &str, arguments: &str) -> String {
 /// dispatch exists for: not blocking the caller's task for its whole run.
 ///
 /// `owner` is the session the call runs for; background tasks are scoped to it.
-fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> String {
-    match name {
+fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> ToolOutcome {
+    let output = match name {
+        "create_file" => return create_file(arguments),
+        "edit_file" | "multi_edit" => return edit(name, arguments),
         "read_file" => exec_read_file(arguments),
         "list_directory" => exec_list_directory(arguments),
         "search_files" => exec_search_files(arguments),
         "read_website" => exec_read_website(arguments),
         "create_directory" => exec_create_directory(arguments),
-        "create_file" => exec_create_file(arguments),
-        "edit_file" => exec_edit_file(arguments),
-        "multi_edit" => exec_multi_edit(arguments),
         "glob" => exec_glob(arguments),
         "write_todos" => exec_write_todos(arguments),
         "remember" => exec_remember(arguments),
@@ -532,7 +566,8 @@ fn execute_sync_tool(name: &str, arguments: &str, owner: Option<&str>) -> String
         "kill_command" => exec_kill_command(arguments, owner),
         "skill" => crate::skills::activate_skill(arguments),
         _ => format!("Unknown tool: {name}"),
-    }
+    };
+    output.into()
 }
 
 // ── web_search ───────────────────────────────────────────────────────────────
@@ -1475,25 +1510,37 @@ impl CreateFileCall {
         })
     }
 
-    fn written(&self) -> String {
-        format!(
-            "Created file: {} ({} bytes)",
-            self.path.display(),
-            self.content.len()
-        )
+    fn written(self) -> ToolOutcome {
+        ToolOutcome {
+            output: format!(
+                "Created file: {} ({} bytes)",
+                self.path.display(),
+                self.content.len()
+            ),
+            change: Some(FileChange {
+                path: self.path,
+                old_text: None,
+                new_text: self.content,
+            }),
+        }
     }
 }
 
 /// fails if file exists so the LLM is forced to use `edit_file` for modifications.
-fn exec_create_file(arguments: &str) -> String {
+fn create_file(arguments: &str) -> ToolOutcome {
     let call = match CreateFileCall::parse(arguments) {
         Ok(call) => call,
-        Err(error) => return error,
+        Err(error) => return error.into(),
     };
     match fs::write(&call.path, &call.content) {
         Ok(()) => call.written(),
-        Err(err) => format!("Error: could not write file: {err}"),
+        Err(err) => format!("Error: could not write file: {err}").into(),
     }
+}
+
+#[cfg(test)]
+fn exec_create_file(arguments: &str) -> String {
+    create_file(arguments).output
 }
 
 // ── edit_file / multi_edit ─────────────────────────────────────────────────
@@ -1674,9 +1721,9 @@ impl EditCall {
         }
     }
 
-    fn written(&self, updated: &str) -> String {
+    fn written(self, contents: String, updated: String) -> ToolOutcome {
         let absolute_path_str = self.path.display().to_string();
-        match &self.ops {
+        let output = match &self.ops {
             EditOps::Single { .. } => format!(
                 "Edited file: {absolute_path_str} ({} bytes written)",
                 updated.len()
@@ -1686,42 +1733,90 @@ impl EditCall {
                 edits.len(),
                 updated.len()
             ),
+        };
+        ToolOutcome {
+            output,
+            change: Some(FileChange {
+                path: self.path,
+                old_text: Some(contents),
+                new_text: updated,
+            }),
         }
     }
 }
 
-/// `edit_file` and `multi_edit` against the disk.
-fn exec_edit(tool: &str, arguments: &str) -> String {
+/// `edit_file` and `multi_edit` against the disk. A `multi_edit` batch is
+/// atomic: each edit is applied to the result of the previous one, and the
+/// file is only written if *every* edit matches.
+fn edit(tool: &str, arguments: &str) -> ToolOutcome {
     let call = match EditCall::parse(tool, arguments) {
         Ok(call) => call,
-        Err(error) => return error,
+        Err(error) => return error.into(),
     };
 
     let contents = match fs::read_to_string(&call.path) {
         Ok(c) => c,
-        Err(err) => return format!("Error: could not read file: {err}"),
+        Err(err) => return format!("Error: could not read file: {err}").into(),
     };
 
     let updated = match call.apply(&contents) {
         Ok(updated) => updated,
-        Err(error) => return error,
+        Err(error) => return error.into(),
     };
 
     match fs::write(&call.path, &updated) {
-        Ok(()) => call.written(&updated),
-        Err(err) => format!("Error: could not write file: {err}"),
+        Ok(()) => call.written(contents, updated),
+        Err(err) => format!("Error: could not write file: {err}").into(),
     }
 }
 
+#[cfg(test)]
 fn exec_edit_file(arguments: &str) -> String {
-    exec_edit("edit_file", arguments)
+    edit("edit_file", arguments).output
 }
 
-/// Apply a batch of edits to one file atomically: each edit is applied to the
-/// result of the previous one, and the file is only written if *every* edit
-/// matches. A failure leaves the file untouched.
+#[cfg(test)]
 fn exec_multi_edit(arguments: &str) -> String {
-    exec_edit("multi_edit", arguments)
+    edit("multi_edit", arguments).output
+}
+
+/// The change a `create_file`, `edit_file` or `multi_edit` call would make,
+/// worked out without writing anything so the permission request can show
+/// the user the diff they are approving. `None` for any other tool, and for
+/// a call that would fail (its error is reported when it runs).
+///
+/// Reads the file the same way the call will, through the client when the
+/// path is routed there, so the preview matches an unsaved buffer. Resolves
+/// relative paths against the cwd, so call it while the session is installed.
+pub async fn preview_file_change(name: &str, arguments: &str) -> Option<FileChange> {
+    match name {
+        "create_file" => {
+            // Not `CreateFileCall::parse`: it creates the parent directories,
+            // and nothing may change on disk before the user approves.
+            let args: Value = serde_json::from_str(arguments).ok()?;
+            let path = absolute_path(Path::new(args.get("path")?.as_str()?));
+            let content = args.get("content")?.as_str()?;
+            (!path.exists()).then(|| FileChange {
+                path,
+                old_text: None,
+                new_text: content.to_string(),
+            })
+        }
+        "edit_file" | "multi_edit" => {
+            let call = EditCall::parse(name, arguments).ok()?;
+            let contents = match client_file_route(name, arguments) {
+                Some(route) => route.read(&call.path).await.ok()?,
+                None => fs::read_to_string(&call.path).ok()?,
+            };
+            let updated = call.apply(&contents).ok()?;
+            Some(FileChange {
+                path: call.path,
+                old_text: Some(contents),
+                new_text: updated,
+            })
+        }
+        _ => None,
+    }
 }
 
 // ── File tools through the ACP client ────────────────────────────────────────
@@ -1747,44 +1842,44 @@ async fn exec_file_tool_via_client(
     name: &str,
     arguments: &str,
     route: &crate::client_fs::Route,
-) -> String {
+) -> ToolOutcome {
     match name {
         "read_file" => {
             let call = match ReadFileCall::parse(arguments) {
                 Ok(call) => call,
-                Err(error) => return error,
+                Err(error) => return error.into(),
             };
             match route.read(&call.path).await {
-                Ok(contents) => call.render(contents),
-                Err(err) => format!("Error: could not read file: {err}"),
+                Ok(contents) => call.render(contents).into(),
+                Err(err) => format!("Error: could not read file: {err}").into(),
             }
         }
         "create_file" => {
             let call = match CreateFileCall::parse(arguments) {
                 Ok(call) => call,
-                Err(error) => return error,
+                Err(error) => return error.into(),
             };
             match route.write(&call.path, &call.content).await {
                 Ok(()) => call.written(),
-                Err(err) => format!("Error: could not write file: {err}"),
+                Err(err) => format!("Error: could not write file: {err}").into(),
             }
         }
         _ => {
             let call = match EditCall::parse(name, arguments) {
                 Ok(call) => call,
-                Err(error) => return error,
+                Err(error) => return error.into(),
             };
             let contents = match route.read(&call.path).await {
                 Ok(c) => c,
-                Err(err) => return format!("Error: could not read file: {err}"),
+                Err(err) => return format!("Error: could not read file: {err}").into(),
             };
             let updated = match call.apply(&contents) {
                 Ok(updated) => updated,
-                Err(error) => return error,
+                Err(error) => return error.into(),
             };
             match route.write(&call.path, &updated).await {
-                Ok(()) => call.written(&updated),
-                Err(err) => format!("Error: could not write file: {err}"),
+                Ok(()) => call.written(contents, updated),
+                Err(err) => format!("Error: could not write file: {err}").into(),
             }
         }
     }
@@ -3405,6 +3500,125 @@ mod tests {
         assert!(result.starts_with("Created file:"), "got: {result}");
         assert!(file_path.exists());
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello world");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn written_files_report_their_change() {
+        let dir = std::env::temp_dir().join("sigit_test_file_change");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("notes.txt");
+
+        let created = create_file(
+            &serde_json::json!({ "path": file_path, "content": "one\ntwo\n" }).to_string(),
+        );
+        assert_eq!(
+            created.change,
+            Some(FileChange {
+                path: file_path.clone(),
+                old_text: None,
+                new_text: "one\ntwo\n".to_string(),
+            })
+        );
+
+        let edited = edit(
+            "edit_file",
+            &serde_json::json!({ "path": file_path, "old_text": "two", "new_text": "2" })
+                .to_string(),
+        );
+        assert_eq!(
+            edited.change,
+            Some(FileChange {
+                path: file_path.clone(),
+                old_text: Some("one\ntwo\n".to_string()),
+                new_text: "one\n2\n".to_string(),
+            })
+        );
+
+        let batch = edit(
+            "multi_edit",
+            &serde_json::json!({
+                "path": file_path,
+                "edits": [
+                    { "old_text": "one", "new_text": "1" },
+                    { "old_text": "2", "new_text": "two" },
+                ],
+            })
+            .to_string(),
+        );
+        let change = batch.change.expect("multi_edit reports its change");
+        assert_eq!(change.old_text.as_deref(), Some("one\n2\n"));
+        assert_eq!(change.new_text, "1\ntwo\n");
+
+        // A call that writes nothing has nothing to show.
+        let failed = edit(
+            "edit_file",
+            &serde_json::json!({ "path": file_path, "old_text": "absent", "new_text": "x" })
+                .to_string(),
+        );
+        assert!(
+            failed.output.starts_with("Error:"),
+            "got: {}",
+            failed.output
+        );
+        assert_eq!(failed.change, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn previewing_a_change_writes_nothing() {
+        let dir = std::env::temp_dir().join("sigit_test_preview_change");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("existing.txt");
+        fs::write(&existing, "alpha\nbeta\n").unwrap();
+
+        let edit_args =
+            serde_json::json!({ "path": existing, "old_text": "beta", "new_text": "gamma" })
+                .to_string();
+        let preview = preview_file_change("edit_file", &edit_args).await;
+        assert_eq!(
+            preview,
+            Some(FileChange {
+                path: existing.clone(),
+                old_text: Some("alpha\nbeta\n".to_string()),
+                new_text: "alpha\ngamma\n".to_string(),
+            })
+        );
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "alpha\nbeta\n");
+
+        // `create_file` would make the parent directories; the preview must not.
+        let new_file = dir.join("missing").join("new.txt");
+        let create_args = serde_json::json!({ "path": new_file, "content": "fresh" }).to_string();
+        let preview = preview_file_change("create_file", &create_args).await;
+        assert_eq!(
+            preview,
+            Some(FileChange {
+                path: new_file.clone(),
+                old_text: None,
+                new_text: "fresh".to_string(),
+            })
+        );
+        assert!(!dir.join("missing").exists());
+
+        // Calls that would fail, and tools that write no file, preview nothing.
+        let unmatched =
+            serde_json::json!({ "path": existing, "old_text": "absent", "new_text": "x" })
+                .to_string();
+        assert_eq!(preview_file_change("edit_file", &unmatched).await, None);
+        let clobber = serde_json::json!({ "path": existing, "content": "x" }).to_string();
+        assert_eq!(preview_file_change("create_file", &clobber).await, None);
+        assert_eq!(
+            preview_file_change(
+                "delete_file",
+                &serde_json::json!({ "path": existing }).to_string()
+            )
+            .await,
+            None
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
