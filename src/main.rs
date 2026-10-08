@@ -1900,7 +1900,14 @@ impl SiGitAgent {
                     // for the connection while the model is not, so a prompt that
                     // brings an image to a model that cannot read one is answered with
                     // a note instead (see `images_for_turn`).
-                    .prompt_capabilities(PromptCapabilities::new().image(true))
+                    //
+                    // Embedded context lets the client inline a resource's
+                    // contents, e.g. an `@file` mention with unsaved edits.
+                    // Without it a client sends only a `resource_link`, and
+                    // sigit reads the file from disk.
+                    .prompt_capabilities(
+                        PromptCapabilities::new().image(true).embedded_context(true),
+                    )
                     // Clients only pass HTTP MCP servers in `mcpServers` to an
                     // agent that says it can reach them. SSE stays off: the
                     // MCP spec deprecated that transport.

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **An `@file` mention can carry unsaved edits.** siGit Code now advertises
+  `promptCapabilities.embeddedContext`, so a client can put a resource's
+  contents in the prompt instead of sending a link to it. Before, a client
+  that follows the spec only sent `resource_link`, and siGit Code read the
+  file from disk, missing whatever the user had not saved yet (#141).
+
 ### Changed
 
 - **A turn that cannot get its session back stops.** A turn on an HTTP backend
