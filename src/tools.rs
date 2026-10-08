@@ -454,6 +454,10 @@ pub struct FileChange {
 pub struct ToolOutcome {
     pub output: String,
     pub change: Option<FileChange>,
+    /// The client terminal `run_command` ran in, when it ran in one (see
+    /// `client_terminal`). Already embedded in the tool call; the finished
+    /// card keeps showing it.
+    pub terminal: Option<String>,
 }
 
 impl From<String> for ToolOutcome {
@@ -461,16 +465,23 @@ impl From<String> for ToolOutcome {
         Self {
             output,
             change: None,
+            terminal: None,
         }
     }
 }
 
 pub async fn execute_tool(name: &str, arguments: &str) -> String {
-    execute_tool_with_change(name, arguments).await.output
+    execute_tool_with_change(name, arguments, None).await.output
 }
 
-/// [`execute_tool`], keeping the file change for the surfaces that render it.
-pub async fn execute_tool_with_change(name: &str, arguments: &str) -> ToolOutcome {
+/// [`execute_tool`], keeping the file change and terminal for the surfaces
+/// that render them. `tool_call_id` is the call as the client knows it, so a
+/// client terminal can be shown in that call's card while it runs.
+pub async fn execute_tool_with_change(
+    name: &str,
+    arguments: &str,
+    tool_call_id: Option<&str>,
+) -> ToolOutcome {
     // Settings are read once per call (not once per hook phase) so a
     // deployment without any [hooks] configured pays one cheap TOML parse
     // per tool call rather than two.
@@ -483,7 +494,7 @@ pub async fn execute_tool_with_change(name: &str, arguments: &str) -> ToolOutcom
         crate::hooks::run_pre_tool_use_hooks(&hook_settings, name, arguments, cwd);
     }
 
-    let result = execute_tool_impl(name, arguments).await;
+    let result = execute_tool_impl(name, arguments, tool_call_id).await;
 
     if let Some(cwd) = &cwd
         && !hook_settings.post_tool_use.is_empty()
@@ -494,11 +505,18 @@ pub async fn execute_tool_with_change(name: &str, arguments: &str) -> ToolOutcom
     result
 }
 
-async fn execute_tool_impl(name: &str, arguments: &str) -> ToolOutcome {
+async fn execute_tool_impl(name: &str, arguments: &str, tool_call_id: Option<&str>) -> ToolOutcome {
     // An editor that serves files from its buffers gets the file tools' reads
     // and writes for paths in the session's roots (see `client_fs`).
     if let Some(route) = client_file_route(name, arguments) {
         return exec_file_tool_via_client(name, arguments, &route).await;
+    }
+    // An editor with a terminal runs foreground commands in it, where the
+    // user sees them live (see `client_terminal`).
+    if name == "run_command"
+        && let Some((call, route)) = client_terminal_route(arguments)
+    {
+        return exec_run_command_via_client(arguments, &call, &route, tool_call_id).await;
     }
 
     match name {
@@ -1522,6 +1540,7 @@ impl CreateFileCall {
                 old_text: None,
                 new_text: self.content,
             }),
+            terminal: None,
         }
     }
 }
@@ -1741,6 +1760,7 @@ impl EditCall {
                 old_text: Some(contents),
                 new_text: updated,
             }),
+            terminal: None,
         }
     }
 }
@@ -2506,37 +2526,125 @@ fn ensure_commit_co_author(cwd: &Path) -> Option<String> {
     }
 }
 
+/// A parsed `run_command` call whose working directory exists.
+struct RunCommandCall {
+    command: String,
+    cwd: PathBuf,
+    background: bool,
+}
+
+impl RunCommandCall {
+    fn parse(arguments: &str) -> Result<Self, String> {
+        let args: Value = serde_json::from_str(arguments)
+            .map_err(|err| format!("Error: failed to parse arguments: {err}"))?;
+
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Error: missing required parameter \"command\"".to_string())?;
+
+        let default_cwd = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let cwd = args
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_cwd);
+        let cwd = absolute_path(Path::new(cwd));
+
+        if !cwd.exists() {
+            return Err(format!(
+                "Error: working directory does not exist: {}",
+                cwd.display()
+            ));
+        }
+
+        Ok(Self {
+            command: command.to_string(),
+            cwd,
+            background: args
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// Co-author attribution for a foreground command: where HEAD was before a
+/// command that looks like it may commit, so a new commit can be detected
+/// afterwards. The string check is only a cheap trigger — a false positive
+/// costs one `git rev-parse` and nothing else. Background tasks skip it:
+/// their commits finish after the tool returns, when there is nothing to
+/// amend from.
+struct CommitWatch {
+    cwd: PathBuf,
+    head_before: Option<String>,
+}
+
+impl CommitWatch {
+    fn start(command_str: &str, cwd: &Path) -> Option<Self> {
+        (command_str.contains("git") && command_str.contains("commit")).then(|| Self {
+            cwd: cwd.to_path_buf(),
+            head_before: git_head(cwd),
+        })
+    }
+
+    /// A new commit appeared under the command: make sure it carries the
+    /// siGit co-author trailer (see `ensure_commit_co_author`), and say so at
+    /// the end of `output` when it had to be amended in.
+    fn finish(self, output: &mut String) {
+        let head_after = git_head(&self.cwd);
+        if head_after.is_some()
+            && head_after != self.head_before
+            && let Some(note) = ensure_commit_co_author(&self.cwd)
+        {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&note);
+        }
+    }
+}
+
+/// The tool result for a finished foreground command, from its combined
+/// output. `exit_code` is `None` when the command did not exit on its own:
+/// killed by `signal` when the client says which, otherwise reported as
+/// exit code -1.
+fn command_result(exit_code: Option<i64>, signal: Option<&str>, combined: String) -> String {
+    let truncated = if combined.len() > COMMAND_OUTPUT_LIMIT {
+        let truncated_str = &combined[..COMMAND_OUTPUT_LIMIT];
+        format!("{truncated_str}\n\n… (output truncated at {COMMAND_OUTPUT_LIMIT} bytes)")
+    } else {
+        combined
+    };
+
+    let ended = match (exit_code, signal) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(signal)) => format!("killed by signal {signal}"),
+        (None, None) => "exit code -1".to_string(),
+    };
+    if exit_code == Some(0) {
+        if truncated.is_empty() {
+            format!("Command succeeded ({ended}) with no output.")
+        } else {
+            format!("Exit code 0:\n{truncated}")
+        }
+    } else {
+        format!("Command failed ({ended}):\n{truncated}")
+    }
+}
+
 /// runs via `sh -c` / `cmd /C`; killed after COMMAND_TIMEOUT unless
 /// `run_in_background` is set, in which case the child is registered as a
 /// background task and polled with `command_output` / stopped with
 /// `kill_command`.
 fn exec_run_command(arguments: &str, owner: Option<&str>) -> String {
-    let args: Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(err) => return format!("Error: failed to parse arguments: {err}"),
+    let call = match RunCommandCall::parse(arguments) {
+        Ok(call) => call,
+        Err(error) => return error,
     };
-
-    let command_str = match args.get("command").and_then(Value::as_str) {
-        Some(c) => c,
-        None => return "Error: missing required parameter \"command\"".to_string(),
-    };
-
-    let default_cwd = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let cwd = args
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or(&default_cwd);
-    let cwd_path = absolute_path(Path::new(cwd));
+    let command_str = call.command.as_str();
+    let cwd_path = call.cwd;
     let cwd_str = cwd_path.display().to_string();
-
-    if !cwd_path.exists() {
-        return format!("Error: working directory does not exist: {cwd_str}");
-    }
-
-    let run_in_background = args
-        .get("run_in_background")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let run_in_background = call.background;
 
     log::info!("run_command: `{command_str}` in `{cwd_str}` (background: {run_in_background})");
 
@@ -2544,18 +2652,7 @@ fn exec_run_command(arguments: &str, owner: Option<&str>) -> String {
         return start_background_task(command_str, &cwd_path, owner.map(str::to_string));
     }
 
-    // Co-author attribution: note where HEAD is before a command that looks
-    // like it may commit, so a new commit can be detected afterwards. The
-    // string check is only a cheap trigger — a false positive costs one
-    // `git rev-parse` and nothing else. Background tasks skip the gate: their
-    // commits finish after the tool returns, when there is nothing to amend
-    // from.
-    let may_commit = command_str.contains("git") && command_str.contains("commit");
-    let head_before = if may_commit {
-        git_head(&cwd_path)
-    } else {
-        None
-    };
+    let commit_watch = CommitWatch::start(command_str, &cwd_path);
 
     let mut child = match spawn_shell(command_str, &cwd_path) {
         Ok(c) => c,
@@ -2615,41 +2712,123 @@ fn exec_run_command(arguments: &str, owner: Option<&str>) -> String {
         }
     }
 
-    let exit_code = status.code().unwrap_or(-1);
     let mut combined = String::new();
     combined.push_str(&String::from_utf8_lossy(&stdout_bytes));
     combined.push_str(&String::from_utf8_lossy(&stderr_bytes));
 
-    // A new commit appeared under this command: make sure it carries the
-    // siGit co-author trailer (see `ensure_commit_co_author`).
-    if may_commit {
-        let head_after = git_head(&cwd_path);
-        if head_after.is_some()
-            && head_after != head_before
-            && let Some(note) = ensure_commit_co_author(&cwd_path)
-        {
-            if !combined.is_empty() && !combined.ends_with('\n') {
-                combined.push('\n');
-            }
-            combined.push_str(&note);
-        }
+    if let Some(watch) = commit_watch {
+        watch.finish(&mut combined);
     }
 
-    let truncated = if combined.len() > COMMAND_OUTPUT_LIMIT {
-        let truncated_str = &combined[..COMMAND_OUTPUT_LIMIT];
-        format!("{truncated_str}\n\n… (output truncated at {COMMAND_OUTPUT_LIMIT} bytes)")
-    } else {
-        combined
+    command_result(status.code().map(i64::from), None, combined)
+}
+
+/// The client terminal route for a `run_command` call, when it should take
+/// one: a foreground command whose directory is in the session's roots, with
+/// a client terminal registered (see [`crate::client_terminal::route_for`]).
+fn client_terminal_route(
+    arguments: &str,
+) -> Option<(RunCommandCall, crate::client_terminal::Route)> {
+    let call = RunCommandCall::parse(arguments).ok()?;
+    if call.background {
+        return None;
+    }
+    let route = crate::client_terminal::route_for(active_session().as_deref(), &call.cwd)?;
+    Some((call, route))
+}
+
+/// A foreground `run_command` in the client's terminal, embedded in the tool
+/// call `tool_call_id`. The result text has the local path's shape, so the
+/// model cannot tell the two apart; a client that cannot start the terminal
+/// gets the command run locally instead.
+async fn exec_run_command_via_client(
+    arguments: &str,
+    call: &RunCommandCall,
+    route: &crate::client_terminal::Route,
+    tool_call_id: Option<&str>,
+) -> ToolOutcome {
+    use crate::client_terminal::Run;
+
+    log::info!(
+        "run_command: `{}` in `{}` (client terminal)",
+        call.command,
+        call.cwd.display()
+    );
+    let commit_watch = CommitWatch::start(&call.command, &call.cwd);
+
+    let run = route
+        .run(
+            &call.command,
+            &call.cwd,
+            tool_call_id,
+            COMMAND_TIMEOUT,
+            COMMAND_OUTPUT_LIMIT as u64,
+        )
+        .await;
+
+    let (output, terminal_id) = match run {
+        Run::NotStarted(error) => {
+            log::warn!("client terminal could not start the command: {error}; running it locally");
+            let arguments = arguments.to_owned();
+            let owner = active_session();
+            return tokio::task::spawn_blocking(move || {
+                exec_run_command(&arguments, owner.as_deref())
+            })
+            .await
+            .unwrap_or_else(|err| format!("Error: run_command task failed: {err}"))
+            .into();
+        }
+        Run::Exited {
+            terminal_id,
+            status,
+            output,
+        } => {
+            let mut combined = client_output_text(output);
+            if let Some(watch) = commit_watch {
+                watch.finish(&mut combined);
+            }
+            let result = command_result(
+                status.exit_code.map(i64::from),
+                status.signal.as_deref(),
+                combined,
+            );
+            (result, terminal_id)
+        }
+        Run::TimedOut {
+            terminal_id,
+            output,
+        } => {
+            let mut result = format!(
+                "Error: command timed out after {} seconds and was killed.",
+                COMMAND_TIMEOUT.as_secs()
+            );
+            let combined = client_output_text(output);
+            if !combined.is_empty() {
+                result.push_str("\nOutput before it was killed:\n");
+                result.push_str(&combined);
+            }
+            (result, terminal_id)
+        }
+        Run::Failed { terminal_id, error } => (format!("Error: {error}"), terminal_id),
     };
 
-    if status.success() {
-        if truncated.is_empty() {
-            format!("Command succeeded (exit code {exit_code}) with no output.")
-        } else {
-            format!("Exit code {exit_code}:\n{truncated}")
-        }
+    ToolOutcome {
+        output,
+        change: None,
+        terminal: Some(terminal_id),
+    }
+}
+
+/// The text of a client terminal's output, saying so when the client dropped
+/// its start to stay under the byte limit.
+fn client_output_text(output: crate::client_terminal::Output) -> String {
+    if output.truncated {
+        format!(
+            "… (earlier output dropped to stay under {COMMAND_OUTPUT_LIMIT} bytes)\n{}",
+            output.output
+        )
     } else {
-        format!("Command failed (exit code {exit_code}):\n{truncated}")
+        output.output
     }
 }
 
@@ -3502,6 +3681,42 @@ mod tests {
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello world");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_results_read_the_same_wherever_the_command_ran() {
+        assert_eq!(
+            command_result(Some(0), None, "hi\n".to_string()),
+            "Exit code 0:\nhi\n"
+        );
+        assert_eq!(
+            command_result(Some(0), None, String::new()),
+            "Command succeeded (exit code 0) with no output."
+        );
+        assert_eq!(
+            command_result(Some(2), None, "boom\n".to_string()),
+            "Command failed (exit code 2):\nboom\n"
+        );
+        // Stopped from the editor: the client names the signal.
+        assert_eq!(
+            command_result(None, Some("SIGTERM"), "partial\n".to_string()),
+            "Command failed (killed by signal SIGTERM):\npartial\n"
+        );
+        // A local process killed by a signal has no code to report.
+        assert_eq!(
+            command_result(None, None, String::new()),
+            "Command failed (exit code -1):\n"
+        );
+
+        let dropped = client_output_text(crate::client_terminal::Output {
+            output: "tail\n".to_string(),
+            truncated: true,
+        });
+        assert!(
+            dropped.starts_with("… (earlier output dropped"),
+            "{dropped}"
+        );
+        assert!(dropped.ends_with("\ntail\n"), "{dropped}");
     }
 
     #[test]
