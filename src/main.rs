@@ -3202,20 +3202,25 @@ impl SiGitAgent {
                 }
 
                 // Permission gate: read-only tools pass straight through; a
-                // mutating tool consults policy and may ask the client.
-                let output = match decision {
-                    None => format!(
-                        "The tool `{}` was not executed again because the model repeated \
-                         the same call three times. Continue without this tool.",
-                        tc.name
+                // mutating tool consults policy and may ask the client. The
+                // flag says whether the tool actually ran: a call that was
+                // denied or skipped ends `failed`, not `completed` (#139).
+                let (output, executed) = match decision {
+                    None => (
+                        format!(
+                            "The tool `{}` was not executed again because the model repeated \
+                             the same call three times. Continue without this tool.",
+                            tc.name
+                        ),
+                        false,
                     ),
                     Some(decision) => match decision {
                         permissions::Decision::Allow => {
-                            tools::execute_tool(&tc.name, &tc.arguments).await
+                            (tools::execute_tool(&tc.name, &tc.arguments).await, true)
                         }
                         permissions::Decision::Deny(reason) => {
                             log::info!("  ✗ {} denied by policy", tc.name);
-                            reason
+                            (reason, false)
                         }
                         permissions::Decision::Ask => {
                             // The answer can take as long as the user likes.
@@ -3266,11 +3271,11 @@ impl SiGitAgent {
                                         )
                                         .ok();
                                     }
-                                    tools::execute_tool(&tc.name, &tc.arguments).await
+                                    (tools::execute_tool(&tc.name, &tc.arguments).await, true)
                                 }
                                 PermissionVerdict::Denied(reason) => {
                                     log::info!("  ✗ {} denied by user", tc.name);
-                                    reason
+                                    (reason, false)
                                 }
                                 PermissionVerdict::TurnCancelled => {
                                     log::info!(
@@ -3322,16 +3327,23 @@ impl SiGitAgent {
                 log::info!("  ← {} chars", output.len());
 
                 if !render_as_plan {
+                    let mut fields = ToolCallUpdateFields::new()
+                        .status(if executed {
+                            ToolCallStatus::Completed
+                        } else {
+                            ToolCallStatus::Failed
+                        })
+                        .content(vec![tool_output_content(&output)])
+                        .raw_output(serde_json::Value::String(output.clone()));
+                    // A denial at the prompt leaves the card titled with the
+                    // permission request's full arguments; put its own back.
+                    if !executed && announced_status == ToolCallStatus::Pending {
+                        fields = fields.title(chat::tool_title(&tc.name, &tc.arguments));
+                    }
                     self.send_tool_call_update(
                         cx,
                         session_id.clone(),
-                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                            tc.id.clone(),
-                            ToolCallUpdateFields::new()
-                                .status(ToolCallStatus::Completed)
-                                .content(vec![tool_output_content(&output)])
-                                .raw_output(serde_json::Value::String(output.clone())),
-                        )),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(tc.id.clone(), fields)),
                     )
                     .ok();
                 }

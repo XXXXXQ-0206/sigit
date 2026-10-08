@@ -28,6 +28,14 @@
   for ids no session ever had. The entry now goes with the last request that
   used it.
 
+- **A tool call that did not run no longer shows as completed.** When policy
+  or plan mode denied a call, when the user picked Deny at the permission
+  prompt, or when the repeat guard skipped a call the model made three times,
+  the editor's card still ended `completed`. Those cards now end `failed`, the
+  same way a call cancelled at the prompt already did. A call denied at the
+  prompt also gets its own title back instead of keeping the permission
+  request's (#139).
+
 ## 1.6.4
 
 ### Added
